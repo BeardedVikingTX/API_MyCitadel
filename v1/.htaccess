@@ -1,0 +1,16 @@
+# ============================================================================
+# MyCitadel API — v1 Routing
+# ============================================================================
+# Maps clean URLs like /v1/auth/csrf to /v1/auth/csrf.php
+# ============================================================================
+
+Options -MultiViews
+RewriteEngine On
+RewriteBase /v1/
+
+# Don't rewrite if the file or directory actually exists
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Append .php to the request
+RewriteRule ^(.*)$ $1.php [L,QSA]
