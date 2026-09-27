@@ -22,7 +22,7 @@ require_once CITADEL_CONFIG . '/crypto.php';
 require_once CITADEL_CONFIG . '/argon2.php';
 require_once CITADEL_CONFIG . '/totp.php';
 
-citadel_rate_limit('2fa_setup', 5, 3600);
+citadel_rate_limit('2fa_setup', 100, 3600);   // TODO: reduce to 5 before launch
 citadel_require_csrf();
 citadel_require_auth('json');
 
@@ -85,23 +85,29 @@ try {
     citadel_json_error('storage_failed', 'Could not generate 2FA secret.', 500);
 }
 
-// Build the otpauth URL for the QR code
-// Build the otpauth URL for the QR code
+// Build the otpauth URL
 $account = $user['username'];
 $otpauth = citadel_totp_otpauth_url($secretBytes, $account, 'MyCitadel');
 $base32  = citadel_base32_encode($secretBytes);
 
-// Generate QR code as an inline SVG data URI
+// Generate QR code as an inline PNG data URI
+// v6 API: use 'outputInterface' (FQCN), NOT 'outputType'
+// outputBase64 defaults to true → result is a data:image/png;base64,... URI
 $qrCodeDataUri = null;
 try {
     if (class_exists(\chillerlan\QRCode\QRCode::class)) {
         $options = new \chillerlan\QRCode\QROptions([
-            'version'    => 5,
-            'outputType' => \chillerlan\QRCode\QRCode::OUTPUT_MARKUP_SVG,
-            'eccLevel'   => \chillerlan\QRCode\QRCode::ECC_L,
+            // No 'version' specified — the library auto-selects the smallest version
+            // that fits the data. Our otpauth URLs can exceed version 5's 864-bit
+            // capacity when the account name is long, so we let it auto-size.
+            'outputInterface' => \chillerlan\QRCode\Output\QRGdImagePNG::class,
+            'eccLevel'        => \chillerlan\QRCode\Common\EccLevel::L,
+            'outputBase64'    => true,
         ]);
         $qrCode = new \chillerlan\QRCode\QRCode($options);
         $qrCodeDataUri = $qrCode->render($otpauth);
+    } else {
+        citadel_log('security', 'warning', 'QRCode class not loaded', []);
     }
 } catch (Throwable $e) {
     citadel_log('security', 'warning', 'QR code generation failed', [
