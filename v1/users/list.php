@@ -3,33 +3,26 @@
  * ███ USERS/LIST.PHP ███
  * MyCitadel — User Directory
  * ----------------------------------------------------------------------------
- * Route : GET /v1/users/list
- * Auth  : Required
- * Rate  : 30 requests per minute per IP
+ * Route  : GET /v1/users/list
+ * Query  : ?q=<search>&limit=24&offset=0&exclude_connected=1
+ * Auth   : Required
+ * Rate   : 30 requests per minute per IP
  *
  * ────────────────────────────────────────────────────────────────────────────
- * WHO APPEARS IN THE LIST
+ * FILTERS
  * ────────────────────────────────────────────────────────────────────────────
- *   • visibility = 'public' (not 'connections_only' or 'hidden')
- *   • is_active = 1, is_banned = 0
- *   • NOT in a blocked relationship with the viewer (either direction)
- *   • NOT the viewer themselves
+ *   q                  — substring search on username or display_name
+ *                        (case-insensitive, escapes LIKE wildcards)
+ *   exclude_connected  — omit users already connected with the viewer
+ *   limit / offset     — pagination (limit capped at 50)
  *
  * ────────────────────────────────────────────────────────────────────────────
- * WHAT EACH ENTRY INCLUDES
+ * VISIBILITY
  * ────────────────────────────────────────────────────────────────────────────
- *   • Public identity: id, username, display_name, avatar, accent_color
- *   • Reputation + badge count
- *   • Member-since date
- *   • Connection state with the viewer: none | pending_out | pending_in | connected
- *     (so the UI knows whether to show "Connect", "Cancel", "Accept", or "Message")
- *
- * ────────────────────────────────────────────────────────────────────────────
- * PRIVACY
- * ────────────────────────────────────────────────────────────────────────────
- *   • We NEVER return encrypted PII (email, phone, address)
- *   • We NEVER return blocked users, in either direction
- *   • We NEVER return users who set visibility='hidden'
+ *   • Only visibility='public' users
+ *   • Excludes banned / inactive users
+ *   • Excludes users blocked by or blocking the viewer
+ *   • Excludes the viewer themselves
  * ========================================================================== */
 
 declare(strict_types=1);
@@ -50,14 +43,63 @@ $me     = (int) citadel_current_user_id();
 $limit  = max(1, min(50, (int) ($_GET['limit']  ?? 24)));
 $offset = max(0,        (int) ($_GET['offset'] ?? 0));
 
-// Optional filter: exclude already-connected users
-$excludeConnected = isset($_GET['exclude_connected']) && $_GET['exclude_connected'] === '1';
+$excludeConnected = isset($_GET['exclude_connected'])
+    && $_GET['exclude_connected'] === '1';
 
-// Viewer's block list — users they should never see
+// ── Optional search query ─────────────────────────────────────────────────
+$q = null;
+if (isset($_GET['q']) && is_string($_GET['q'])) {
+    $q = trim(mb_substr($_GET['q'], 0, 64));
+    if ($q === '') $q = null;
+}
+
+// ── Viewer's block list — users they should never see ─────────────────────
 $blockedIds = citadel_rel_exclusion_ids($me);
 
-// Build the SQL. We join relationships once to know the connection state.
-$sql = '
+// ── Build WHERE fragments once, reuse in both queries ─────────────────────
+$whereParts = [
+    'u.id != ?',
+    'u.is_active = 1',
+    'u.is_banned = 0',
+    '(p.visibility IS NULL OR p.visibility = "public")',
+];
+
+// Base params order matters — must match ? order in the SQL below
+// The SQL places the viewer id twice in the JOIN, then once in WHERE,
+// so params start with [me, me, me]
+$baseParams = [$me, $me, $me];
+
+// Search filter
+$searchSql    = '';
+$searchParams = [];
+if ($q !== null) {
+    // Escape LIKE metacharacters so "50%" doesn't act as a wildcard
+    $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
+    $searchSql = ' AND (u.username LIKE ? OR p.display_name LIKE ?)';
+    $searchParams = [$like, $like];
+}
+
+// Blocked users filter
+$blockedSql    = '';
+$blockedParams = [];
+if (!empty($blockedIds)) {
+    $ph = implode(',', array_fill(0, count($blockedIds), '?'));
+    $blockedSql = " AND u.id NOT IN ({$ph})";
+    $blockedParams = $blockedIds;
+}
+
+// exclude_connected filter
+$connectedSql = $excludeConnected
+    ? ' AND (r.state IS NULL OR r.state != "connected")'
+    : '';
+
+$whereSql = ' WHERE ' . implode(' AND ', $whereParts)
+          . $searchSql
+          . $blockedSql
+          . $connectedSql;
+
+// ── Main query ────────────────────────────────────────────────────────────
+$selectSql = '
     SELECT
         u.id, u.username, u.created_at,
         p.display_name, p.avatar_url, p.avatar_frame_id, p.accent_color,
@@ -71,43 +113,25 @@ $sql = '
       LEFT JOIN user_stats    s ON s.user_id = u.id
       LEFT JOIN user_relationships r
              ON (r.user_low_id  = LEAST(u.id, ?) AND r.user_high_id = GREATEST(u.id, ?))
-     WHERE u.id != ?
-       AND u.is_active = 1
-       AND u.is_banned = 0
-       AND (p.visibility IS NULL OR p.visibility = "public")
 ';
 
-$params = [$me, $me, $me];
+// $limit is already sanitized int; safe to inline (avoids PDO LIMIT binding issue)
+$limitSql = ' ORDER BY u.created_at DESC LIMIT ' . $limit
+          . ' OFFSET ' . $offset;
 
-// Exclude blocked users (either direction) — using NOT IN
-if (!empty($blockedIds)) {
-    $placeholders = implode(',', array_fill(0, count($blockedIds), '?'));
-    $sql .= " AND u.id NOT IN ({$placeholders})";
-    $params = array_merge($params, $blockedIds);
-}
+$params = array_merge($baseParams, $searchParams, $blockedParams);
 
-// Optional: hide already-connected users
-if ($excludeConnected) {
-    $sql .= ' AND (r.state IS NULL OR r.state != "connected")';
-}
+$rows = db_all($selectSql . $whereSql . $limitSql, $params);
 
-$sql .= ' ORDER BY u.created_at DESC LIMIT ? OFFSET ?';
-$params[] = $limit;
-$params[] = $offset;
-
-$rows = db_all($sql, $params);
-
-// Transform each row into the API shape
+// ── Transform ─────────────────────────────────────────────────────────────
 $users = array_map(static function (array $row) use ($me): array {
-    // Compute connection state from the viewer's perspective
     $state = 'none';
     if ($row['rel_state'] === 'connected') {
         $state = 'connected';
     } elseif ($row['rel_state'] === 'pending') {
         $state = ((int) $row['rel_initiated_by'] === $me) ? 'pending_out' : 'pending_in';
     } elseif ($row['rel_state'] === 'blocked') {
-        // Shouldn't happen (we excluded them) — but defensive
-        $state = 'blocked';
+        $state = 'blocked';   // defensive — should be excluded by NOT IN
     }
 
     return [
@@ -115,7 +139,9 @@ $users = array_map(static function (array $row) use ($me): array {
         'username'        => (string) $row['username'],
         'display_name'    => $row['display_name'],
         'avatar_url'      => $row['avatar_url'],
-        'avatar_frame_id' => $row['avatar_frame_id'] !== null ? (int) $row['avatar_frame_id'] : null,
+        'avatar_frame_id' => $row['avatar_frame_id'] !== null
+                                ? (int) $row['avatar_frame_id']
+                                : null,
         'accent_color'    => (string) $row['accent_color'],
         'country_code'    => $row['country_code'],
         'state_code'      => $row['state_code'],
@@ -126,34 +152,25 @@ $users = array_map(static function (array $row) use ($me): array {
     ];
 }, $rows);
 
-// Total count (for pagination UI)
+// ── Count query (same filters, no LIMIT) ──────────────────────────────────
 $countSql = '
     SELECT COUNT(*)
       FROM users u
       LEFT JOIN user_profiles p ON p.user_id = u.id
       LEFT JOIN user_relationships r
              ON (r.user_low_id  = LEAST(u.id, ?) AND r.user_high_id = GREATEST(u.id, ?))
-     WHERE u.id != ?
-       AND u.is_active = 1
-       AND u.is_banned = 0
-       AND (p.visibility IS NULL OR p.visibility = "public")
-';
-$countParams = [$me, $me, $me];
+'
+. $whereSql;
 
-if (!empty($blockedIds)) {
-    $placeholders = implode(',', array_fill(0, count($blockedIds), '?'));
-    $countSql .= " AND u.id NOT IN ({$placeholders})";
-    $countParams = array_merge($countParams, $blockedIds);
-}
-if ($excludeConnected) {
-    $countSql .= ' AND (r.state IS NULL OR r.state != "connected")';
-}
-
+$countParams = array_merge($baseParams, $searchParams, $blockedParams);
 $total = (int) db_scalar($countSql, $countParams);
 
+// ── Response ──────────────────────────────────────────────────────────────
 citadel_json_ok([
-    'users'  => $users,
-    'total'  => $total,
-    'limit'  => $limit,
-    'offset' => $offset,
+    'users'    => $users,
+    'total'    => $total,
+    'limit'    => $limit,
+    'offset'   => $offset,
+    'has_more' => ($offset + count($users)) < $total,
+    'q'        => $q,   // echo back so the client knows the filter
 ]);
