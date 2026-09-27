@@ -379,17 +379,30 @@ const CITADEL_BLOCKED_UA_SUBSTRINGS = [
 
 /**
  * Apply the User-Agent blocklist (production only).
+ *
+ * Includes a dev bypass mechanism: if DEV_BYPASS_UAS in .env contains a
+ * comma-separated list of UA substrings, matching requests skip the block.
+ * Used for controlled debugging. MUST be emptied before public launch.
  */
 function citadel_apply_ua_filter(): void
 {
     if (!CITADEL_IS_PRODUCTION) return;
     if (PHP_SAPI === 'cli') return;
-
-    // Internal health checks are exempt.
     if (citadel_is_internal_request()) return;
 
     $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
-    if ($ua === '') return;  // some native apps legitimately send no UA
+
+    // ── Dev bypass — exempt specific UAs even in production ─────────────
+    $bypass = getenv('DEV_BYPASS_UAS') ?: '';
+    if ($bypass !== '' && $ua !== '') {
+        foreach (array_filter(array_map('trim', explode(',', $bypass))) as $pattern) {
+            if ($pattern !== '' && str_contains($ua, $pattern)) {
+                return;  // trusted client — skip blocklist
+            }
+        }
+    }
+
+    if ($ua === '') return;
 
     $uaLower = strtolower($ua);
     foreach (CITADEL_BLOCKED_UA_SUBSTRINGS as $needle) {
@@ -414,7 +427,7 @@ function citadel_apply_ua_filter(): void
         }
     }
 }
-
+// Apply the User-Agent filter (production only).
 citadel_apply_ua_filter();
 
 // Classify the client type.

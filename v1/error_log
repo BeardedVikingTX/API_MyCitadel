@@ -1,0 +1,12 @@
+[27-Sep-2026 14:26:35 UTC] PHP Fatal error:  Cannot redeclare function citadel_apply_ua_filter() (previously declared in /home/beardedviking/api.mycitadel.lol/v1/bootstrap.php:383) in /home/beardedviking/api.mycitadel.lol/v1/bootstrap.php on line 418
+Stack trace:
+#0 {main}
+[27-Sep-2026 14:27:42 UTC] PHP Fatal error:  Cannot redeclare function citadel_apply_ua_filter() (previously declared in /home/beardedviking/api.mycitadel.lol/v1/bootstrap.php:383) in /home/beardedviking/api.mycitadel.lol/v1/bootstrap.php on line 418
+Stack trace:
+#0 {main}
+[27-Sep-2026 14:27:52 UTC] PHP Fatal error:  Cannot redeclare function citadel_apply_ua_filter() (previously declared in /home/beardedviking/api.mycitadel.lol/v1/bootstrap.php:383) in /home/beardedviking/api.mycitadel.lol/v1/bootstrap.php on line 418
+Stack trace:
+#0 {main}
+[27-Sep-2026 14:28:00 UTC] PHP Fatal error:  Cannot redeclare function citadel_apply_ua_filter() (previously declared in /home/beardedviking/api.mycitadel.lol/v1/bootstrap.php:383) in /home/beardedviking/api.mycitadel.lol/v1/bootstrap.php on line 418
+Stack trace:
+#0 {main}
