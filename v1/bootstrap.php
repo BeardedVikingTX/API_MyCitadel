@@ -1,7 +1,7 @@
 <?php
 /* ============================================================================
  * ███ BOOTSTRAP.PHP ███
- * MyCitadel — API Bootstrap & Request Lifecycle Manager (v2)
+ * MyCitadel — API Bootstrap & Request Lifecycle Manager (v3)
  * ----------------------------------------------------------------------------
  * Path      : /path/to/api.mycitadel.lol/v1/bootstrap.php
  * Author    : Bearded Viking (https://beardedviking.org)
@@ -13,7 +13,7 @@
  *
  *     00. Request ID (generated FIRST so all errors have it)
  *     01. Bootstrap guard (prevent double-loading)
- *     02. Path constants + directory existence validation
+ *     02. Path constants + directory validation
  *     03. Environment detection
  *     04. Error reporting configuration
  *     05. Custom error / exception / shutdown handlers
@@ -21,10 +21,11 @@
  *     07. Environment integrity validation
  *     08. Timezone & locale
  *     09. HTTP method allowlist
- *     10. Client identification (browser vs mobile vs API)
+ *     09b. Request origin gate (NEW — declare yourself or be refused)
+ *     10. Client identification + User-Agent filter
  *     11. Real IP resolution (Cloudflare / proxy aware)
  *     12. HTTP security headers
- *     13. CORS policy (web + mobile WebView aware)
+ *     13. CORS policy (environment-aware)
  *     14. Composer autoload
  *     15. Session subsystem
  *     16. Argon2id subsystem
@@ -32,24 +33,16 @@
  *     18. Structured logging
  *     19. JSON response helpers
  *     20. Request input helpers
- *     21. Rate limiting (real-IP aware)
+ *     21. Rate limiting (with file locking)
+ *     22. Internal request whitelist
+ *     23. Request replay protection (optional header)
  *
  * PHILOSOPHY
  *   • Fail closed. If anything is uncertain, refuse the request.
- *   • Never leak internals. Errors return generic JSON, details go to logs.
- *   • Every request gets an ID before any code can fail.
- *   • Mobile and web clients are first-class citizens.
- *   • The request lifecycle is auditable from the first byte.
- *
- * USAGE
- *   Every endpoint file starts with:
- *       require_once __DIR__ . '/../bootstrap.php';
- *
- *   Then it can immediately use:
- *       citadel_json_ok(['user' => $user]);
- *       $db = citadel_db();
- *       $body = citadel_input_json();
- *       citadel_rate_limit('login', 10, 60);
+ *   • Every client must identify itself.
+ *   • Production is strict. Development is flexible.
+ *   • Nothing is unhackable. Everything is expensive to attack.
+ *   • Log every rejection. Suspicious patterns become visible.
  * ========================================================================== */
 
 declare(strict_types=1);
@@ -57,15 +50,7 @@ declare(strict_types=1);
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 00. REQUEST ID — GENERATED FIRST
- * --------------------------------------------------------------------------
- * This is the very first thing we do. If ANY subsequent code fails — even
- * a parse error in this file — the shutdown handler will have a valid
- * request ID to correlate with logs.
- *
- * Format: 32 lowercase hex chars. Client can supply their own via
- * X-Request-ID for distributed tracing; we validate the format strictly
- * to prevent log injection.
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
 $GLOBALS['citadel_request_id'] = bin2hex(random_bytes(16));
 
@@ -78,7 +63,7 @@ if (!empty($_SERVER['HTTP_X_REQUEST_ID'])
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 01. BOOTSTRAP GUARD
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
 if (defined('CITADEL_BOOTSTRAPPED')) {
     return;
@@ -88,11 +73,7 @@ define('CITADEL_BOOTSTRAPPED', true);
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 02. PATH CONSTANTS + DIRECTORY VALIDATION
- * --------------------------------------------------------------------------
- * Every path the application needs is defined here. Immediately after,
- * we verify the directories exist and are writable (where applicable).
- * Failing here is better than failing 40 lines into a request.
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
 if (!defined('CITADEL_ROOT')) {
     define('CITADEL_ROOT', '/home/beardedviking/secure_mycitadel.lol');
@@ -111,9 +92,6 @@ define('CITADEL_SESSIONS',  CITADEL_ROOT . '/sessions');
 define('CITADEL_VENDOR',    CITADEL_ROOT . '/vendor');
 define('CITADEL_ENV_FILE',  CITADEL_ROOT . '/.env');
 
-// Ensure every critical directory exists before we need it.
-// We create these here rather than at point-of-use so a boot can never
-// half-succeed and leave the app in an inconsistent state.
 foreach ([
     CITADEL_LOGS,
     CITADEL_LOGS . '/php',
@@ -127,17 +105,13 @@ foreach ([
     }
 }
 
-// Point PHP's error_log at our directory (it now exists).
 ini_set('log_errors', '1');
 ini_set('error_log', CITADEL_LOGS . '/php/error.log');
 
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 03. ENVIRONMENT DETECTION
- * --------------------------------------------------------------------------
- * Environment is inferred from server-controlled signals only. Never
- * from anything the client can influence.
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
 $citadelEnv = getenv('CITADEL_ENV') ?: null;
 
@@ -156,10 +130,7 @@ define('CITADEL_IS_DEVELOPMENT', CITADEL_ENV === 'development');
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 04. ERROR REPORTING
- * --------------------------------------------------------------------------
- * Development: loud.
- * Production:  silent to the client, verbose to the log.
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
 error_reporting(E_ALL);
 
@@ -174,16 +145,8 @@ if (CITADEL_IS_DEVELOPMENT) {
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 05. ERROR / EXCEPTION / SHUTDOWN HANDLERS
- * --------------------------------------------------------------------------
- * The safety net. Every uncaught failure becomes a clean JSON response.
- * Internal details always go to the log, never to the client.
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
-/**
- * Emit a fatal JSON error response and stop execution.
- * Use this for infrastructure-level failures only — endpoints should
- * use citadel_json_error() instead.
- */
 function citadel_fatal(string $publicMessage, ?Throwable $e = null, int $httpCode = 500): never
 {
     $line = sprintf(
@@ -196,10 +159,7 @@ function citadel_fatal(string $publicMessage, ?Throwable $e = null, int $httpCod
     );
     @error_log($line);
 
-    if (headers_sent()) {
-        exit;
-    }
-
+    if (headers_sent()) exit;
     while (ob_get_level() > 0) { ob_end_clean(); }
 
     header('Content-Type: application/json; charset=utf-8');
@@ -216,8 +176,6 @@ function citadel_fatal(string $publicMessage, ?Throwable $e = null, int $httpCod
     exit;
 }
 
-// In development, warnings become exceptions — but NOT deprecations,
-// because third-party libraries often emit them harmlessly.
 if (CITADEL_IS_DEVELOPMENT) {
     set_error_handler(static function (int $severity, string $message, string $file, int $line): bool {
         if (!(error_reporting() & $severity)) return false;
@@ -246,17 +204,11 @@ register_shutdown_function(static function (): void {
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 06. ENVIRONMENT VARIABLE LOADING (.env)
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
-/**
- * Parse a .env file into getenv()/putenv()/$_ENV/$_SERVER.
- * Never overwrites real environment variables set by the web server.
- */
 function citadel_load_env(string $path): void
 {
-    if (!is_file($path) || !is_readable($path)) {
-        return;
-    }
+    if (!is_file($path) || !is_readable($path)) return;
 
     $lines = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     if ($lines === false) return;
@@ -294,10 +246,7 @@ citadel_load_env(CITADEL_ENV_FILE);
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 07. ENVIRONMENT INTEGRITY VALIDATION
- * --------------------------------------------------------------------------
- * Fail-closed on missing or unsafe configuration. This must run BEFORE
- * anything downstream relies on .env values.
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
 $validatorFile = CITADEL_CONFIG . '/env_validator.php';
 if (is_file($validatorFile)) {
@@ -315,11 +264,7 @@ setlocale(LC_ALL, 'C');
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 09. HTTP METHOD ALLOWLIST
- * --------------------------------------------------------------------------
- * Reject TRACE, CONNECT, and any non-standard method outright. These are
- * never used by our clients (web, mobile, API tools) and their presence
- * indicates either a misconfiguration or an attack.
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
 if (PHP_SAPI !== 'cli') {
     $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -340,21 +285,139 @@ if (PHP_SAPI !== 'cli') {
 
 
 /* ══════════════════════════════════════════════════════════════════════════
- * 10. CLIENT IDENTIFICATION
+ * 09b. REQUEST ORIGIN GATE — NEW
  * --------------------------------------------------------------------------
- * Three client types talk to this API:
+ * State-changing requests (POST/PUT/PATCH/DELETE) MUST declare themselves
+ * by one of two mechanisms:
  *
- *   • browser  — web app (mycitadel.lol) or mobile WebView
- *   • android  — native Android app (Kotlin)
- *   • api      — CLI tools, Postman, server-to-server
+ *   1. Origin header — set by browsers on cross-origin requests.
+ *   2. X-Citadel-Client header — set by our own native/mobile clients.
  *
- * Native mobile apps should send:
- *   X-Citadel-Client: android/1.0.0
+ * Requests with NEITHER are treated as anonymous CLI/script calls. In
+ * production, we refuse them outright. In development/staging, we allow
+ * them (so curl-based testing works).
  *
- * This lets endpoints adjust behavior (e.g., longer-lived tokens for
- * mobile, stricter CSRF for browsers) without guessing.
+ * GET requests are exempt — they're read-only, and browsers don't always
+ * send Origin on same-origin navigations.
+ *
+ * Rationale: this blocks naive "curl the API" attacks and forces every
+ * attacker to spoof a header, raising the cost of reconnaissance.
  * ═════════════════════════════════════════════════════════════════════════ */
 
+if (PHP_SAPI !== 'cli' && CITADEL_IS_PRODUCTION) {
+    $method       = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    $isStateful   = in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true);
+    $hasOrigin    = !empty($_SERVER['HTTP_ORIGIN']);
+    $hasClientHdr = !empty($_SERVER['HTTP_X_CITADEL_CLIENT']);
+    $isInternal   = citadel_is_internal_request();  // defined in §22
+
+    if ($isStateful && !$hasOrigin && !$hasClientHdr && !$isInternal) {
+        // Log the rejection before responding (defense in depth — see §18).
+        // We can't call citadel_log() yet because it may not be defined if
+        // this file somehow loads in a broken order. Fall back to error_log.
+        @error_log(sprintf(
+            '[CITADEL GATE] Rejected unauthenticated %s from %s rid=%s',
+            $method,
+            $_SERVER['REMOTE_ADDR'] ?? '?',
+            $GLOBALS['citadel_request_id'] ?? '?'
+        ));
+
+        http_response_code(403);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode([
+            'status'     => 'error',
+            'code'       => 'origin_required',
+            'message'    => 'Requests must declare an Origin or X-Citadel-Client header.',
+            'request_id' => $GLOBALS['citadel_request_id'],
+            'ts'         => gmdate('c'),
+        ]);
+        exit;
+    }
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 10. CLIENT IDENTIFICATION + USER-AGENT FILTER
+ * --------------------------------------------------------------------------
+ * Two responsibilities:
+ *
+ *   (a) Identify the client type: browser | android | ios | api
+ *   (b) Filter out obvious scanner traffic in production only
+ *
+ * The User-Agent filter is DEFENSE IN DEPTH, not defense in principle.
+ * An attacker can trivially spoof a UA. But scanners using default UAs
+ * (sqlmap, nmap, nikto) get bounced at the door, and that's worth the
+ * five lines of code.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Known-bad User-Agent substrings. Match is case-insensitive.
+ * Only enforced in production.
+ *
+ * NOTE: 'python-requests' and 'go-http-client' appear here because NO
+ * legitimate MyCitadel client uses them. If you ever add a server-to-
+ * server integration that does, remove that entry.
+ */
+const CITADEL_BLOCKED_UA_SUBSTRINGS = [
+    // Command-line tools
+    'curl/', 'wget/', 'httpie/',
+    // Scripting HTTP libraries
+    'python-requests', 'python-urllib', 'aiohttp', 'httpx',
+    'go-http-client', 'libwww-perl', 'ruby/', 'java/',
+    // Security scanners
+    'sqlmap', 'nikto', 'nmap', 'masscan', 'nessus', 'openvas',
+    'burpsuite', 'zaproxy', 'zap/', 'w3af', 'skipfish', 'arachni',
+    // Directory busters
+    'dirbuster', 'gobuster', 'ffuf', 'wfuzz', 'dirb/',
+    // Credential attackers
+    'hydra', 'medusa', 'patator',
+    // Site rippers
+    'httrack', 'webcopier',
+    // Generic bots / scanners
+    'netsystemsresearch', 'shodan', 'censys',
+];
+
+/**
+ * Apply the User-Agent blocklist (production only).
+ */
+function citadel_apply_ua_filter(): void
+{
+    if (!CITADEL_IS_PRODUCTION) return;
+    if (PHP_SAPI === 'cli') return;
+
+    // Internal health checks are exempt.
+    if (citadel_is_internal_request()) return;
+
+    $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+    if ($ua === '') return;  // some native apps legitimately send no UA
+
+    $uaLower = strtolower($ua);
+    foreach (CITADEL_BLOCKED_UA_SUBSTRINGS as $needle) {
+        if (str_contains($uaLower, $needle)) {
+            @error_log(sprintf(
+                '[CITADEL UA-FILTER] Blocked UA="%s" from %s rid=%s',
+                substr($ua, 0, 120),
+                $_SERVER['REMOTE_ADDR'] ?? '?',
+                $GLOBALS['citadel_request_id'] ?? '?'
+            ));
+
+            http_response_code(403);
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode([
+                'status'     => 'error',
+                'code'       => 'client_not_permitted',
+                'message'    => 'This client is not permitted to access the API.',
+                'request_id' => $GLOBALS['citadel_request_id'],
+                'ts'         => gmdate('c'),
+            ]);
+            exit;
+        }
+    }
+}
+
+citadel_apply_ua_filter();
+
+// Classify the client type.
 $clientHeader = $_SERVER['HTTP_X_CITADEL_CLIENT'] ?? '';
 $clientType   = 'browser';
 $clientVer    = '';
@@ -363,11 +426,11 @@ if (preg_match('#^(browser|android|ios|api)/([0-9A-Za-z.\-]+)$#i', $clientHeader
     $clientType = strtolower($m[1]);
     $clientVer  = $m[2];
 } elseif (!empty($_SERVER['HTTP_USER_AGENT'])) {
-    // Fallback: infer from User-Agent for legacy clients that don't send
-    // the header yet.
     $ua = $_SERVER['HTTP_USER_AGENT'];
     if (str_starts_with($ua, 'MyCitadelAndroid/')) {
         $clientType = 'android';
+    } elseif (str_starts_with($ua, 'MyCitadeliOS/')) {
+        $clientType = 'ios';
     }
 }
 
@@ -377,26 +440,8 @@ $GLOBALS['citadel_client_version'] = $clientVer;
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 11. REAL IP RESOLUTION
- * --------------------------------------------------------------------------
- * Behind Cloudflare, a CDN, or a reverse proxy, $_SERVER['REMOTE_ADDR']
- * is the proxy's IP — not the user's. Without this, all rate limits
- * collapse into one bucket.
- *
- * SECURITY: We only trust forwarded headers when REMOTE_ADDR is in the
- * trusted proxy list. Otherwise, X-Forwarded-For is trivially spoofable
- * by any client.
- *
- * Configure trusted proxies in .env:
- *   TRUSTED_PROXIES=173.245.48.0/20,103.21.244.0/22,...
- * (Cloudflare's published ranges: https://www.cloudflare.com/ips/)
- * ═════════════════════════════════════════════════════════════════════════ */
+ * ========================================================================== */
 
-/**
- * Resolve the real client IP, honoring proxy headers only from trusted
- * upstreams. Result is cached in $GLOBALS.
- *
- * @return string IPv4 or IPv6 address
- */
 function citadel_client_ip(): string
 {
     static $resolved = null;
@@ -404,7 +449,6 @@ function citadel_client_ip(): string
 
     $remote = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
 
-    // Parse trusted proxy CIDR ranges from env.
     $trustedRaw = getenv('TRUSTED_PROXIES') ?: '';
     $trusted = array_filter(array_map('trim', explode(',', $trustedRaw)));
 
@@ -416,17 +460,13 @@ function citadel_client_ip(): string
         }
     }
 
-    if (!$isTrusted) {
-        return $resolved = $remote;
-    }
+    if (!$isTrusted) return $resolved = $remote;
 
-    // Cloudflare-specific header (preferred when present and trusted).
     $cfIp = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? null;
     if (is_string($cfIp) && filter_var($cfIp, FILTER_VALIDATE_IP)) {
         return $resolved = $cfIp;
     }
 
-    // X-Forwarded-For — first IP in the list is the original client.
     $xff = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? null;
     if (is_string($xff) && $xff !== '') {
         $parts = array_map('trim', explode(',', $xff));
@@ -436,7 +476,6 @@ function citadel_client_ip(): string
         }
     }
 
-    // X-Real-IP — used by some nginx configurations.
     $real = $_SERVER['HTTP_X_REAL_IP'] ?? null;
     if (is_string($real) && filter_var($real, FILTER_VALIDATE_IP)) {
         return $resolved = $real;
@@ -445,16 +484,8 @@ function citadel_client_ip(): string
     return $resolved = $remote;
 }
 
-/**
- * Check whether an IP falls within a CIDR range.
- *
- * @param string $ip
- * @param string $cidr  e.g. "173.245.48.0/20" or a bare IP
- * @return bool
- */
 function citadel_ip_in_cidr(string $ip, string $cidr): bool
 {
-    // Bare IP — exact match.
     if (strpos($cidr, '/') === false) {
         return $ip === $cidr;
     }
@@ -497,49 +528,55 @@ if (PHP_SAPI !== 'cli' && !headers_sent()) {
 
 
 /* ══════════════════════════════════════════════════════════════════════════
- * 13. CORS POLICY — WEB + MOBILE WEBVIEW
+ * 13. CORS POLICY — ENVIRONMENT-AWARE
  * --------------------------------------------------------------------------
- * Browser clients: strict origin allowlist.
- * Mobile native apps: no Origin header at all — implicitly allowed.
- * Mobile WebViews: origins like "capacitor://localhost" or
- *   "file://" — handled by the extended allowlist below.
+ * Production: only .lol domains. No localhost, no capacitor://.
+ * Dev/staging: adds localhost + mobile WebView origins for testing.
  * ═════════════════════════════════════════════════════════════════════════ */
 
-/** @var array<int,string> Origins permitted to call this API. */
-const CITADEL_ALLOWED_ORIGINS = [
-    // ── Web ──────────────────────────────────────────────────────────
-    'https://mycitadel.lol',
-    'https://www.mycitadel.lol',
-    'https://vendors.mycitadel.lol',
+/**
+ * Build the allowed-origins list based on environment.
+ * @return array<int,string>
+ */
+function citadel_allowed_origins(): array
+{
+    // Always allowed — production domains.
+    $origins = [
+        'https://mycitadel.lol',
+        'https://www.mycitadel.lol',
+        'https://vendors.mycitadel.lol',
+    ];
 
-    // ── Local development ────────────────────────────────────────────
-    'http://localhost:8000',
-    'http://localhost:8080',
-    'http://127.0.0.1:8000',
-    'http://127.0.0.1:8080',
+    // Development/staging additions.
+    if (!CITADEL_IS_PRODUCTION) {
+        $origins = array_merge($origins, [
+            'http://localhost:8000',
+            'http://localhost:8080',
+            'http://127.0.0.1:8000',
+            'http://127.0.0.1:8080',
+            'capacitor://localhost',
+            'ionic://localhost',
+            'http://localhost',
+        ]);
+    }
 
-    // ── Mobile WebView (Capacitor / Cordova / React Native WebView) ──
-    'capacitor://localhost',
-    'ionic://localhost',
-    'http://localhost',
-];
+    return $origins;
+}
 
 function citadel_apply_cors(): void
 {
     if (PHP_SAPI === 'cli' || headers_sent()) return;
 
     $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-
-    // No Origin header → native mobile or CLI tool. No CORS headers needed;
-    // the client isn't a browser and doesn't enforce same-origin policy.
     if ($origin === '') return;
 
-    if (in_array($origin, CITADEL_ALLOWED_ORIGINS, true)) {
+    $allowed = citadel_allowed_origins();
+
+    if (in_array($origin, $allowed, true)) {
         header('Access-Control-Allow-Origin: ' . $origin);
         header('Access-Control-Allow-Credentials: true');
         header('Vary: Origin');
     } else {
-        // Disallowed origin. Reject preflight immediately.
         if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
             http_response_code(403);
             header('Content-Type: application/json; charset=utf-8');
@@ -554,7 +591,7 @@ function citadel_apply_cors(): void
     }
 
     header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type, X-CSRF-Token, X-Requested-With, Authorization, X-Citadel-Client, X-Request-ID');
+    header('Access-Control-Allow-Headers: Content-Type, X-CSRF-Token, X-Requested-With, Authorization, X-Citadel-Client, X-Request-ID, X-Request-Time');
     header('Access-Control-Expose-Headers: X-Request-ID');
     header('Access-Control-Max-Age: 600');
 
@@ -601,13 +638,6 @@ if (is_file($argonFile)) {
  * 17. DATABASE CONNECTION (LAZY SINGLETON)
  * ========================================================================== */
 
-/**
- * Return a shared PDO connection. Opened on first use, cached for the
- * request lifetime.
- *
- * @throws RuntimeException if configuration is missing
- * @return PDO
- */
 function citadel_db(): PDO
 {
     static $pdo = null;
@@ -646,14 +676,6 @@ function citadel_db(): PDO
  * 18. STRUCTURED LOGGING
  * ========================================================================== */
 
-/**
- * Write a structured JSON-lines log entry.
- *
- * @param string $channel  'auth' | 'api' | 'db' | 'security' | 'stripe'
- * @param string $level    'debug' | 'info' | 'warning' | 'error' | 'critical'
- * @param string $message
- * @param array  $context
- */
 function citadel_log(string $channel, string $level, string $message, array $context = []): void
 {
     $channel = preg_replace('/[^a-z0-9_]/', '', strtolower($channel)) ?: 'app';
@@ -661,6 +683,12 @@ function citadel_log(string $channel, string $level, string $message, array $con
 
     if (!is_dir($logDir)) {
         @mkdir($logDir, 0700, true);
+    }
+
+    // Cap context payload to prevent log-flooding DoS.
+    $encodedCtx = json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if ($encodedCtx !== false && strlen($encodedCtx) > 8192) {
+        $context = ['_truncated' => true, '_original_size' => strlen($encodedCtx)];
     }
 
     $entry = [
@@ -727,10 +755,6 @@ function citadel_json_send(string $status, array $payload, int $httpCode): never
  * 20. REQUEST INPUT HELPERS
  * ========================================================================== */
 
-/**
- * Read and decode the JSON request body. Returns [] if empty.
- * Rejects non-JSON content types on unsafe methods.
- */
 function citadel_input_json(): array
 {
     static $cached = null;
@@ -774,6 +798,17 @@ function citadel_input_string(string $key, ?string $default = null, int $maxLen 
     $val = $body[$key];
     if (!is_string($val)) return $default;
 
+    // ⚠️ Do NOT trim passwords or secrets — whitespace is significant.
+    // Endpoints that need trimming must do it themselves.
+    if ($maxLen > 256) {
+        // Long fields (passwords, tokens) — return raw
+        if (strlen($val) > $maxLen) {
+            citadel_json_error('input_too_long',
+                "Field '{$key}' exceeds {$maxLen} characters.", 400);
+        }
+        return $val;
+    }
+
     $val = trim($val);
     if (strlen($val) > $maxLen) {
         citadel_json_error('input_too_long',
@@ -795,13 +830,11 @@ function citadel_input_int(string $key, ?int $default = null): ?int
 
 
 /* ══════════════════════════════════════════════════════════════════════════
- * 21. RATE LIMITING (REAL-IP AWARE)
+ * 21. RATE LIMITING (WITH FILE LOCKING)
  * --------------------------------------------------------------------------
- * Uses citadel_client_ip() so limits apply to the actual client even
- * behind Cloudflare or a CDN.
- *
- * Rate-limit keys are hashed with the fingerprint key so they don't
- * leak the raw IP in the filesystem.
+ * The v2 version had a race condition: two concurrent requests could both
+ * read "under limit" and both write. This version uses flock() to ensure
+ * the read-modify-write cycle is atomic.
  * ═════════════════════════════════════════════════════════════════════════ */
 
 function citadel_rate_limit(string $bucket, int $maxAttempts, int $windowSeconds): void
@@ -810,8 +843,6 @@ function citadel_rate_limit(string $bucket, int $maxAttempts, int $windowSeconds
 
     $ip = citadel_client_ip();
 
-    // Hash the IP for storage. Key is derived from the session fingerprint
-    // key which is set in session.php.
     $hmacKey = $GLOBALS['citadel_fingerprint_key'] ?? 'default-rate-limit-key';
     $ipHash  = hash_hmac('sha256', $ip, $hmacKey);
 
@@ -824,11 +855,25 @@ function citadel_rate_limit(string $bucket, int $maxAttempts, int $windowSeconds
     $now         = time();
     $windowStart = $now - $windowSeconds;
 
-    $hits = [];
-    if (is_file($file)) {
-        $raw = @file_get_contents($file);
-        if ($raw !== false) {
-            $decoded = json_decode($raw, true);
+    // Open with exclusive lock for the whole read-modify-write cycle.
+    $fh = @fopen($file, 'c+');
+    if ($fh === false) {
+        // Can't open the file — fail open for availability.
+        // (Rate limiter failing = better than the whole API going down.)
+        return;
+    }
+
+    if (!flock($fh, LOCK_EX)) {
+        fclose($fh);
+        return;  // Couldn't lock — fail open
+    }
+
+    try {
+        // Read existing hits.
+        $contents = stream_get_contents($fh);
+        $hits = [];
+        if ($contents !== false && $contents !== '') {
+            $decoded = json_decode($contents, true);
             if (is_array($decoded)) {
                 $hits = array_values(array_filter(
                     $decoded,
@@ -836,41 +881,129 @@ function citadel_rate_limit(string $bucket, int $maxAttempts, int $windowSeconds
                 ));
             }
         }
+
+        // Enforce limit.
+        if (count($hits) >= $maxAttempts) {
+            $retryAfter = $windowSeconds - ($now - min($hits));
+            flock($fh, LOCK_UN);
+            fclose($fh);
+
+            header('Retry-After: ' . max(1, $retryAfter));
+
+            if (function_exists('citadel_log')) {
+                citadel_log('security', 'warning', 'Rate limit exceeded', [
+                    'bucket'  => $safeBucket,
+                    'ip_hash' => substr($ipHash, 0, 12),
+                ]);
+            }
+
+            citadel_json_error('rate_limited',
+                "Too many requests. Try again in {$retryAfter} seconds.", 429);
+        }
+
+        // Record this hit and write back atomically.
+        $hits[] = $now;
+        ftruncate($fh, 0);
+        rewind($fh);
+        fwrite($fh, json_encode($hits));
+        fflush($fh);
+
+    } finally {
+        flock($fh, LOCK_UN);
+        fclose($fh);
     }
-
-    if (count($hits) >= $maxAttempts) {
-        $retryAfter = $windowSeconds - ($now - min($hits));
-        header('Retry-After: ' . max(1, $retryAfter));
-
-        citadel_log('security', 'warning', 'Rate limit exceeded', [
-            'bucket'  => $safeBucket,
-            'ip_hash' => substr($ipHash, 0, 12),
-        ]);
-
-        citadel_json_error('rate_limited',
-            "Too many requests. Try again in {$retryAfter} seconds.", 429);
-    }
-
-    $hits[] = $now;
-    @file_put_contents($file, json_encode($hits), LOCK_EX);
 }
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 22. INTERNAL REQUEST WHITELIST — NEW
+ * --------------------------------------------------------------------------
+ * Requests from localhost are treated as "internal" and bypass the
+ * origin gate and UA filter. This lets:
+ *   • Health-check scripts run without spoofing headers
+ *   • Cron jobs call internal endpoints
+ *   • Local monitoring tools hit the API cleanly
+ *
+ * In production, only 127.0.0.1 and ::1 are internal. In dev/staging,
+ * that's still the case — we don't want a compromised network position
+ * to grant internal status.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+function citadel_is_internal_request(): bool
+{
+    static $cached = null;
+    if ($cached !== null) return $cached;
+
+    if (PHP_SAPI === 'cli') return $cached = true;
+
+    $remote = $_SERVER['REMOTE_ADDR'] ?? '';
+    $cached = in_array($remote, ['127.0.0.1', '::1', 'localhost'], true);
+    return $cached;
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 23. REQUEST REPLAY PROTECTION — OPTIONAL HEADER
+ * --------------------------------------------------------------------------
+ * If a client sends X-Request-Time (Unix timestamp), we validate it's
+ * within ±300 seconds of server time. This blocks replay attacks where
+ * an attacker captures a request and re-sends it later.
+ *
+ * Clients that don't send the header aren't affected — this is opt-in
+ * hardening for mobile apps and future signed-request schemes.
+ *
+ * The header alone isn't sufficient for replay protection (attacker can
+ * also spoof the timestamp), but when combined with HMAC signing later,
+ * it becomes the timestamp component of a signed request.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+function citadel_check_request_time(): void
+{
+    if (PHP_SAPI === 'cli') return;
+    if (citadel_is_internal_request()) return;
+
+    $header = $_SERVER['HTTP_X_REQUEST_TIME'] ?? '';
+    if ($header === '') return;  // opt-in
+
+    if (!ctype_digit($header)) {
+        citadel_json_error('invalid_request_time',
+            'X-Request-Time must be a Unix timestamp.', 400);
+    }
+
+    $clientTime = (int) $header;
+    $serverTime = time();
+    $drift      = abs($serverTime - $clientTime);
+
+    if ($drift > 300) {
+        @error_log(sprintf(
+            '[CITADEL REPLAY] Clock drift %ds from %s rid=%s',
+            $drift,
+            $_SERVER['REMOTE_ADDR'] ?? '?',
+            $GLOBALS['citadel_request_id'] ?? '?'
+        ));
+
+        citadel_json_error('request_expired',
+            'Request timestamp is outside the allowed window.', 400);
+    }
+}
+
+citadel_check_request_time();
 
 
 /* ══════════════════════════════════════════════════════════════════════════
  * ▓▓▓ END OF BOOTSTRAP.PHP ▓▓▓
  * --------------------------------------------------------------------------
- * Bootstrap is infrastructure, not business logic. If you're tempted to
- * add an endpoint's worth of code here, don't. Put it in the endpoint.
- *
- * The order matters:
+ * Order matters:
  *   00. Request ID   — before anything can fail
  *   01. Guard        — prevent double-load
  *   02. Paths        — before any file operation
  *   05. Handlers     — before any code that might throw
  *   06. Env          — before anything reads config
  *   07. Validation   — before anything uses config
- *   15. Session      — before auth helpers are called
- *   17. Database     — lazy; opened only when needed
+ *   09b. Origin Gate — before any endpoint runs
+ *   10. UA Filter    — before any endpoint runs
+ *   21. Rate Limit   — with flock, atomic
+ *   22. Internal     — used by gate + UA filter
  *
  * When in doubt: fail closed, log loudly, return JSON.
  * — Bearded Viking
