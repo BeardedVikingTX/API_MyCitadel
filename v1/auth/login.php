@@ -216,6 +216,45 @@ if (!$verified) {
         'Invalid credentials.', 401);
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * 07b. TWO-FACTOR REQUIREMENT
+ * --------------------------------------------------------------------------
+ * Password verified. If 2FA is enabled, we pause here — no authenticated
+ * session is established. We store a pending state in the session and
+ * return "two_fa_required". The client then calls /auth/login_2fa.php.
+ *
+ * The pending user_id comes from OUR session, never from the client.
+ * A client-supplied user_id would be a trivial 2FA bypass.
+ * ========================================================================== */
+
+// Fetch 2FA state (not yet loaded above)
+$twoFaRow = db_one(
+    'SELECT two_fa_enabled FROM users WHERE id = ? LIMIT 1',
+    [(int) $user['id']]
+);
+
+if ($twoFaRow !== null && (int) $twoFaRow['two_fa_enabled'] === 1) {
+
+    // Store pending state in session
+    $_SESSION['_citadel']['two_fa_pending'] = [
+        'user_id'  => (int) $user['id'],
+        'expires'  => time() + 300,   // 5 minutes
+        'attempts' => 0,
+        'started'  => time(),
+    ];
+
+    citadel_log('auth', 'info', 'Login: 2FA required', [
+        'user_id' => (int) $user['id'],
+    ]);
+
+    citadel_json_ok([
+        'two_fa_required' => true,
+        'message'         => 'Enter the 6-digit code from your authenticator app.',
+        'expires_in'      => 300,
+        'csrf_token'      => citadel_csrf_token(),   // may have been rotated above
+    ]);
+    // json_ok exits — no further code runs
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 08. SUCCESS PATH
