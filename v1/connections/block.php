@@ -1,13 +1,25 @@
 <?php
 /* ============================================================================
  * ███ CONNECTIONS/BLOCK.PHP ███
+ * MyCitadel — Block / Deny / Sever
+ * ----------------------------------------------------------------------------
  * Route : POST /v1/connections/block
  * Body  : { "user_id": 5, "reason": "optional" }
  *
- * Handles deny / sever / block — all three are the same operation.
+ * THREE CONTEXTS, ONE ENDPOINT:
  *
- * MESSAGING HOOK: when Batch 4 ships, add citadel_messages_destroy_pair()
- * here to hard-delete all messages between the two parties.
+ *   1. DENY  (target sent me a pending request)
+ *      → Silent to target's UI? No — notify them: "declined"
+ *      → No reputation change (they never earned it)
+ *
+ *   2. CANCEL + BLOCK (I sent them a pending request, now blocking)
+ *      → Silent (I'm withdrawing)
+ *      → No reputation change
+ *
+ *   3. SEVER (we were connected, now blocked)
+ *      → Silent (the invisibility is the message)
+ *      → Deduct 25 reputation from BOTH users
+ *      → [Batch 4+] Destroy all messages between the two parties
  * ========================================================================== */
 
 declare(strict_types=1);
@@ -15,6 +27,8 @@ declare(strict_types=1);
 require_once __DIR__ . '/../bootstrap.php';
 require_once CITADEL_CONFIG . '/db.php';
 require_once CITADEL_CONFIG . '/connections.php';
+require_once CITADEL_CONFIG . '/notifications.php';
+require_once CITADEL_CONFIG . '/reputation.php';
 
 citadel_rate_limit('conn_block', 30, 3600);
 citadel_require_csrf();
@@ -36,18 +50,67 @@ if ($targetId === $me) {
     citadel_json_error('cannot_block_self', 'You cannot block yourself.', 400);
 }
 
-$existing = citadel_rel_get($me, $targetId);
-
-// Idempotent: already blocked → 200
-if ($existing !== null && $existing['state'] === 'blocked') {
-    citadel_json_ok(['state' => 'blocked', 'message' => 'Already blocked.']);
+// Validate target exists (fixes the 500-vs-404 issue)
+$targetExists = db_scalar('SELECT 1 FROM users WHERE id = ? LIMIT 1', [$targetId]);
+if ($targetExists === null) {
+    citadel_json_error('user_not_found', 'User not found.', 404);
 }
 
+$db = citadel_db();
+
 try {
+    $db->beginTransaction();
+
+    // ── Load current relationship with lock ────────────────────────────────
+    [$low, $high] = citadel_pair($me, $targetId);
+
+    $stmt = $db->prepare(
+        'SELECT * FROM user_relationships
+          WHERE user_low_id = ? AND user_high_id = ?
+          FOR UPDATE'
+    );
+    $stmt->execute([$low, $high]);
+    $rel = $stmt->fetch();
+
+    // If already blocked → idempotent success
+    if ($rel !== false && $rel['state'] === 'blocked') {
+        $db->commit();
+        citadel_json_ok([
+            'state'   => 'blocked',
+            'message' => 'Already blocked.',
+        ]);
+    }
+
+    // ── Determine context ──────────────────────────────────────────────────
+    $wasConnected = ($rel !== false && $rel['state'] === 'connected');
+    $wasPending   = ($rel !== false && $rel['state'] === 'pending');
+    $pendingFromMe= $wasPending && ((int) $rel['initiated_by'] === $me);
+    $pendingToMe  = $wasPending && ((int) $rel['initiated_by'] !== $me);
+
+    // ── Apply the block ────────────────────────────────────────────────────
     citadel_rel_set($me, $targetId, 'blocked', $me, $reason);
 
-    // If they were connected, decrement both counters
-    if ($existing !== null && $existing['state'] === 'connected') {
+    // ── Reputation deduction if we were connected ──────────────────────────
+    if ($wasConnected) {
+        // Deduct the 25 they each earned on connection
+        award_points(
+            $me,
+            'connection_severed',
+            -25,
+            'user',
+            $targetId,
+            'Connection severed'
+        );
+        award_points(
+            $targetId,
+            'connection_severed',
+            -25,
+            'user',
+            $me,
+            'Connection severed'
+        );
+
+        // Decrement connection counters
         db_query(
             'UPDATE user_stats SET connection_count = GREATEST(0, connection_count - 1) WHERE user_id = ?',
             [$me]
@@ -56,19 +119,20 @@ try {
             'UPDATE user_stats SET connection_count = GREATEST(0, connection_count - 1) WHERE user_id = ?',
             [$targetId]
         );
+
+        // TODO (Batch 4): citadel_messages_destroy_pair($me, $targetId);
     }
 
-    // TODO (Batch 4): citadel_messages_destroy_pair($me, $targetId);
+    // ── Pending from them? Cancel without counter adjustment ───────────────
+    if ($wasPending && $pendingFromMe) {
+        // I'm cancelling my own request. No counter existed, no rep awarded.
+        // Nothing extra to do.
+    }
 
-    // Silent — no notification. The invisibility is the message.
-
-    citadel_log('api', 'info', 'User blocked', [
-        'blocker' => $me,
-        'blocked' => $targetId,
-        'had_state' => $existing['state'] ?? 'none',
-    ]);
+    $db->commit();
 
 } catch (Throwable $e) {
+    if ($db->inTransaction()) $db->rollBack();
     citadel_log('api', 'error', 'Block failed', [
         'blocker' => $me,
         'blocked' => $targetId,
@@ -77,7 +141,43 @@ try {
     citadel_json_error('block_failed', 'Could not complete the operation.', 500);
 }
 
+// ── Notify the initiator ONLY if we denied THEIR request ──────────────────
+// (Silent for sever and cancel — the invisibility is the message.)
+if ($wasPending && $pendingToMe) {
+    try {
+        citadel_notify(
+            $targetId,   // they initiated
+            'connection_denied',
+            'Connection request declined',
+            'Your connection request was not accepted.',
+            $me,
+            ['user_id' => $me],
+            null   // no link — the target is now hidden from them
+        );
+    } catch (Throwable $e) {
+        citadel_log('api', 'warning', 'Deny notification failed', [
+            'target_id' => $targetId,
+            'error'     => $e->getMessage(),
+        ]);
+    }
+}
+
+citadel_log('api', 'info', 'Block applied', [
+    'blocker'      => $me,
+    'blocked'      => $targetId,
+    'was_connected'=> $wasConnected,
+    'was_pending'  => $wasPending,
+]);
+
+$message = $wasConnected
+    ? 'Connection severed. All messages destroyed. Reputation adjusted.'
+    : ($wasPending && $pendingToMe
+        ? 'Request declined. You will no longer see each other.'
+        : 'User blocked. You will no longer see each other.');
+
 citadel_json_ok([
-    'state'   => 'blocked',
-    'message' => 'User blocked. You will no longer see each other.',
+    'state'    => 'blocked',
+    'severed'  => $wasConnected,
+    'denied'   => ($wasPending && $pendingToMe),
+    'message'  => $message,
 ]);

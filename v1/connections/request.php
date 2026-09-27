@@ -23,7 +23,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
 
 $me       = (int) citadel_current_user_id();
 $targetId = citadel_input_int('user_id');
-$message  = citadel_input_string('message', null, 255);
+$messageRaw = citadel_input_string('message', null, 255);
+$message    = ($messageRaw !== null && $messageRaw !== '')
+    ? citadel_sanitize_text($messageRaw, 255)
+    : null;
 
 if ($targetId === null || $targetId <= 0) {
     citadel_json_error('invalid_user', 'A valid user_id is required.', 400);
