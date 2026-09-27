@@ -646,6 +646,14 @@ if (is_file($argonFile)) {
     require_once $argonFile;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * 16b. MAILER SUBSYSTEM
+ * ========================================================================== */
+
+$mailerFile = CITADEL_CONFIG . '/mailer.php';
+if (is_file($mailerFile)) {
+    require_once $mailerFile;
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 17. DATABASE CONNECTION (LAZY SINGLETON)
@@ -675,8 +683,11 @@ function citadel_db(): PDO
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
             PDO::ATTR_PERSISTENT         => false,
-            PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES {$char} COLLATE {$char}_unicode_ci",
         ]);
+        
+        // Set connection collation explicitly (avoids deprecated PDO::MYSQL_ATTR_INIT_COMMAND).
+        // PHP 8.5+ deprecates the constant, so we run it as a post-connect statement.
+        $pdo->exec("SET NAMES {$char} COLLATE {$char}_unicode_ci");
     } catch (PDOException $e) {
         citadel_fatal('Database connection failed.', $e, 503);
     }

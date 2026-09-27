@@ -100,12 +100,16 @@ $usernameIndex = citadel_crypto_blind_index($identifier, 'username');
 $db = citadel_db();
 
 $stmt = $db->prepare(
-    'SELECT id, username, email_ct, email_nonce, password_hash,
-            reputation, premium, is_active
-     FROM users
-     WHERE email_index = ? OR username_index = ?
+    'SELECT u.id, u.username, u.email_ct, u.email_nonce, u.password_hash,
+            u.is_premium, u.is_active,
+            COALESCE(s.reputation_points, 0) AS reputation_points
+     FROM users u
+     LEFT JOIN user_stats s ON s.user_id = u.id
+     WHERE u.email_index = ? OR u.username_index = ?
      LIMIT 1'
 );
+$stmt->execute([$emailIndex, $usernameIndex]);
+$user = $stmt->fetch();
 $stmt->execute([$emailIndex, $usernameIndex]);
 $user = $stmt->fetch();
 
@@ -227,8 +231,8 @@ citadel_json_ok([
     'user' => [
         'id'         => (int) $user['id'],
         'username'   => $user['username'],
-        'reputation' => (int) $user['reputation'],
-        'premium'    => (bool) $user['premium'],
+        'reputation' => (int) $user['reputation_points'],
+        'premium'    => (bool) $user['is_premium'],
     ],
     'csrf_token' => citadel_csrf_token(),
 ]);

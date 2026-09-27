@@ -101,11 +101,13 @@ $userId = citadel_current_user_id();
 $db = citadel_db();
 
 $stmt = $db->prepare(
-    'SELECT id, username, username_index, email_ct, email_nonce, email_index,
-            password_hash, reputation, premium, email_verified, is_active,
-            created_at, last_login_at
-     FROM users
-     WHERE id = ?
+    'SELECT u.id, u.username, u.username_index, u.email_ct, u.email_nonce,
+            u.email_index, u.password_hash, u.is_premium, u.email_verified,
+            u.is_active, u.created_at, u.last_login_at,
+            COALESCE(s.reputation_points, 0) AS reputation_points
+     FROM users u
+     LEFT JOIN user_stats s ON s.user_id = u.id
+     WHERE u.id = ?
      LIMIT 1'
 );
 $stmt->execute([$userId]);
@@ -324,11 +326,13 @@ citadel_log('auth', 'info', 'Profile updated', [
 
 // Reload the row so we return canonical state, not our in-memory guesses.
 $stmt = $db->prepare(
-    'SELECT id, username, email_ct, email_nonce,
-            reputation, premium, email_verified, is_active,
-            created_at, updated_at, last_login_at
-     FROM users
-     WHERE id = ?
+    'SELECT u.id, u.username, u.email_ct, u.email_nonce,
+            u.is_premium, u.email_verified, u.is_active,
+            u.created_at, u.updated_at, u.last_login_at,
+            COALESCE(s.reputation_points, 0) AS reputation_points
+     FROM users u
+     LEFT JOIN user_stats s ON s.user_id = u.id
+     WHERE u.id = ?
      LIMIT 1'
 );
 $stmt->execute([$user['id']]);
