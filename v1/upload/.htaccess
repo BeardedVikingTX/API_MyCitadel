@@ -1,0 +1,14 @@
+<IfModule mod_security2.c>
+    SecRuleEngine DetectionOnly
+    SecRequestBodyAccess Off
+</IfModule>
+<IfModule mod_security.c>
+    SecFilterEngine Off
+    SecFilterScanPOST Off
+</IfModule>
+<IfModule mod_php.c>
+    php_value upload_max_filesize 64M
+    php_value post_max_size 70M
+    php_value max_execution_time 120
+    php_value max_input_time 120
+</IfModule>

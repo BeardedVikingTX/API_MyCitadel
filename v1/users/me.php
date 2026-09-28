@@ -97,9 +97,15 @@ $stmt = $db->prepare(
     'SELECT u.id, u.username, u.email_ct, u.email_nonce,
             u.is_premium, u.email_verified, u.is_active,
             u.created_at, u.updated_at, u.last_login_at,
-            COALESCE(s.reputation_points, 0) AS reputation_points
+            COALESCE(s.reputation_points, 0) AS reputation_points,
+            p.display_name,
+            p.avatar_url,
+            p.banner_url,
+            p.tagline,
+            p.visibility
      FROM users u
-     LEFT JOIN user_stats s ON s.user_id = u.id
+     LEFT JOIN user_stats    s ON s.user_id = u.id
+     LEFT JOIN user_profiles p ON p.user_id = u.id
      WHERE u.id = ?
      LIMIT 1'
 );
@@ -157,5 +163,12 @@ citadel_json_ok([
         'last_login_at'  => $user['last_login_at']
             ? gmdate('c', strtotime($user['last_login_at']))
             : null,
+
+        // ── Profile fields (were missing entirely) ───────────────────
+        'display_name'   => $user['display_name'] ?? null,
+        'tagline'        => $user['tagline'] ?? null,
+        'avatar_url'     => $user['avatar_url'] ?? null,
+        'banner_url'     => $user['banner_url'] ?? null,
+        'visibility'     => $user['visibility'] ?? 'public',
     ],
 ]);
