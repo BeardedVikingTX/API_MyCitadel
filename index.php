@@ -558,6 +558,48 @@ $ENDPOINTS = [
             ],
         ],
     ],
+    'Premium Subscriptions' => [
+        'description' => 'Monthly premium tier powered by Stripe Checkout. Users upgrade through a Stripe-hosted payment page; all subscription state is synced back via signed webhooks.',
+        'endpoints' => [
+            [
+                'method'  => 'GET',
+                'path'    => '/v1/premium/status.php',
+                'auth'    => true,
+                'csrf'    => false,
+                'summary' => 'Return the current premium status for the authenticated user.',
+                'response'=> '{"status":"ok","premium":{"is_premium":true,"premium_since":"2026-09-28T00:53:35+00:00","premium_expires_at":"2026-10-28T00:41:43+00:00","has_customer":true,"has_subscription":true,"stripe_status":"active"}}',
+                'notes'   => 'Cheap lookup — safe to call on every page load. Combines our cached state with a live Stripe lookup when a subscription exists.',
+            ],
+            [
+                'method'  => 'POST',
+                'path'    => '/v1/premium/checkout.php',
+                'auth'    => true,
+                'csrf'    => true,
+                'summary' => 'Create a Stripe Checkout session for the premium subscription.',
+                'body'    => "{}",
+                'response'=> '{"status":"ok","checkout_url":"https://checkout.stripe.com/c/pay/cs_...","session_id":"cs_..."}',
+                'notes'   => 'Returns a URL to redirect the browser to. On success, Stripe sends the user to STRIPE_SUCCESS_URL with ?session_id= appended, and fires a checkout.session.completed webhook. Rate-limited to 10 requests per hour per user.',
+            ],
+            [
+                'method'  => 'POST',
+                'path'    => '/v1/premium/portal.php',
+                'auth'    => true,
+                'csrf'    => true,
+                'summary' => 'Open the Stripe Customer Portal to manage or cancel the subscription.',
+                'body'    => "{}",
+                'response'=> '{"status":"ok","portal_url":"https://billing.stripe.com/p/session?secret=..."}',
+                'notes'   => 'Users can update their payment method, download invoices, and cancel — either immediately or at the end of the billing period. When the subscription is canceled, Stripe fires a customer.subscription.deleted webhook and premium access ends at the period boundary. No additional endpoint is needed for cancellation.',
+            ],
+            [
+                'method'  => 'POST',
+                'path'    => '/v1/premium/webhook.php',
+                'auth'    => false,
+                'csrf'    => false,
+                'summary' => 'Stripe → MyCitadel event delivery. Not for client use.',
+                'notes'   => 'Called only by Stripe. Authenticity is enforced by HMAC-SHA256 signature verification against STRIPE_WEBHOOK_SECRET — never by session cookie or CSRF token. Handles checkout.session.completed, customer.subscription.created/updated/deleted, invoice.paid, invoice_payment.paid, and invoice.payment_failed. Events are deduplicated by event ID for idempotency.',
+            ],
+        ],
+    ],    
 ];
 
 /* ══════════════════════════════════════════════════════════════════════════
