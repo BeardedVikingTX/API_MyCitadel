@@ -311,7 +311,25 @@ if (PHP_SAPI !== 'cli' && CITADEL_IS_PRODUCTION) {
     $hasClientHdr = !empty($_SERVER['HTTP_X_CITADEL_CLIENT']);
     $isInternal   = citadel_is_internal_request();  // defined in §22
 
-    if ($isStateful && !$hasOrigin && !$hasClientHdr && !$isInternal) {
+    // ── Stripe webhook exemption ─────────────────────────────────────────
+    // Stripe does not send Origin or X-Citadel-Client headers. It cannot —
+    // it's a server-to-server call, not a browser request. Blocking it here
+    // would break every premium subscription.
+    //
+    // This is SAFE because the webhook endpoint does something stronger:
+    // it verifies the request body against STRIPE_WEBHOOK_SECRET using
+    // HMAC-SHA256 (Stripe's signing mechanism). Only Stripe (and this
+    // server) know that secret. A forged request cannot produce a valid
+    // signature, so it cannot pass the check inside webhook.php.
+    //
+    // The exemption only opens the door far enough for the request to
+    // reach the signature verifier. It does not grant any privileges.
+    $isStripeWebhook = str_contains(
+        $_SERVER['REQUEST_URI'] ?? '',
+        '/v1/premium/webhook'
+    );
+
+    if ($isStateful && !$hasOrigin && !$hasClientHdr && !$isInternal && !$isStripeWebhook) {
         // Log the rejection before responding (defense in depth — see §18).
         // We can't call citadel_log() yet because it may not be defined if
         // this file somehow loads in a broken order. Fall back to error_log.
