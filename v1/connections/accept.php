@@ -131,7 +131,16 @@ try {
         $me,
         'New connection established'
     );
-
+    // Consume the original connection_request notification — it served
+    // its purpose; the request has been accepted.
+    db_query(
+        "DELETE FROM notifications
+          WHERE user_id = ?
+            AND actor_id = ?
+            AND type = 'connection_request'",
+        [$me, $initiatorId]
+    );
+    
     $db->commit();
 
 } catch (Throwable $e) {

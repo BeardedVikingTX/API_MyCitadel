@@ -129,6 +129,32 @@ try {
         // Nothing extra to do.
     }
 
+    // ── Consume the connection_request notification if we denied them ──────
+    if ($wasPending && $pendingToMe) {
+        // They requested us; we're denying. Remove the notification
+        // from our own feed so it doesn't linger.
+        db_query(
+            "DELETE FROM notifications
+              WHERE user_id = ?
+                AND actor_id = ?
+                AND type = 'connection_request'",
+            [$me, $targetId]
+        );
+    }
+    
+    // ── Cancel case: clean up OUR OWN outgoing request notification ────────
+    if ($wasPending && $pendingFromMe) {
+        // We sent the request and now cancelling. The recipient's notification
+        // (about our request) is now stale — remove it from their feed.
+        db_query(
+            "DELETE FROM notifications
+              WHERE user_id = ?
+                AND actor_id = ?
+                AND type = 'connection_request'",
+            [$targetId, $me]
+        );
+    }
+    
     $db->commit();
 
 } catch (Throwable $e) {

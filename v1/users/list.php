@@ -102,7 +102,8 @@ $whereSql = ' WHERE ' . implode(' AND ', $whereParts)
 $selectSql = '
     SELECT
         u.id, u.username, u.created_at,
-        p.display_name, p.avatar_url, p.avatar_frame_id, p.accent_color,
+        p.display_name, p.tagline, p.avatar_url, p.avatar_frame_id,
+        p.banner_url, p.wallpaper_url, p.accent_color,
         p.country_code, p.state_code,
         COALESCE(s.reputation_points, 0) AS reputation,
         COALESCE(s.badge_count, 0)       AS badge_count,
@@ -138,10 +139,13 @@ $users = array_map(static function (array $row) use ($me): array {
         'id'              => (int) $row['id'],
         'username'        => (string) $row['username'],
         'display_name'    => $row['display_name'],
+        'tagline'         => $row['tagline'],
         'avatar_url'      => $row['avatar_url'],
         'avatar_frame_id' => $row['avatar_frame_id'] !== null
                                 ? (int) $row['avatar_frame_id']
                                 : null,
+        'banner_url'      => $row['banner_url'],
+        'wallpaper_url'   => $row['wallpaper_url'],
         'accent_color'    => (string) $row['accent_color'],
         'country_code'    => $row['country_code'],
         'state_code'      => $row['state_code'],

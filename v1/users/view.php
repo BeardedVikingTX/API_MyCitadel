@@ -65,15 +65,35 @@ if ($targetId <= 0) {
 $target = db_one(
     'SELECT
         u.id, u.username, u.email_ct, u.email_nonce,
-        u.is_premium, u.is_active, u.is_banned, u.created_at, u.last_login_at,
-        p.visibility, p.display_name, p.tagline, p.bio, p.personal_motto,
-        p.avatar_url, p.avatar_frame_id, p.banner_url, p.banner_frame_id,
-        p.accent_color, p.theme_preference, p.pronouns,
+        u.is_premium, u.is_active, u.is_banned,
+        u.created_at, u.last_login_at,
+        p.visibility, p.display_name, p.tagline, p.bio,
+        p.personal_motto, p.pronouns,
+        p.avatar_url, p.avatar_frame_id,
+        p.banner_url, p.banner_frame_id,
+        p.wallpaper_url, p.wallpaper_opacity, p.wallpaper_blur,
+        p.accent_color, p.theme_preference,
+        p.border_thickness, p.border_color, p.border_style,
+        p.font_heading, p.font_body, p.font_mono,
+        p.music_video_id, p.music_autoplay,
         p.country_code, p.state_code, p.timezone,
-        p.job_title, p.company_name, p.industry, p.education,
-        p.hobbies_and_interests, p.looking_for, p.availability,
-        p.website_url, p.github_url, p.twitter_url, p.linkedin_url,
-        p.mastodon_url, p.bluesky_url, p.public_pgp_key,
+        p.job_title, p.company_name, p.years_at_company,
+        p.work_description, p.industry, p.education,
+        p.relationship_status, p.has_kids, p.kids_count,
+        p.languages_spoken, p.personality_type, p.zodiac_sign,
+        p.looking_for, p.availability, p.contact_preference,
+        p.favorite_movies, p.favorite_books, p.favorite_songs,
+        p.favorite_shows, p.favorite_games,
+        p.favorite_quotes, p.favorite_food,
+        p.hobbies_and_interests,
+        p.website_url, p.facebook_url, p.twitter_url, p.instagram_url,
+        p.tiktok_url, p.linkedin_url, p.youtube_url, p.threads_url,
+        p.mastodon_url, p.bluesky_url, p.discord_handle,
+        p.steam_id, p.psn_handle, p.xbox_gamertag,
+        p.kick_url, p.twitch_url, p.podcast_url,
+        p.github_url, p.stackoverflow_url,
+        p.hackerone_url, p.bugcrowd_url, p.intigriti_url, p.yeswehack_url,
+        p.public_pgp_key, p.signal_username,
         p.show_email, p.show_phone, p.show_location, p.show_birthday,
         p.show_real_name, p.show_social_links, p.show_premium,
         COALESCE(s.reputation_points, 0) AS reputation,
@@ -153,9 +173,8 @@ $profile = [
     'is_self'         => $isSelf,
 ];
 
-// Add fields visible only to connections or self
 if ($showFull) {
-    // Location — respect show_location toggle unless it's you
+    // Location
     if ($isSelf || (int) $target['show_location'] === 1) {
         $profile['location'] = [
             'country_code' => $target['country_code'],
@@ -164,35 +183,106 @@ if ($showFull) {
         ];
     }
 
-    // Professional info — always public
+    // Work
     $profile['work'] = [
-        'job_title'   => $target['job_title'],
-        'company'     => $target['company_name'],
-        'industry'    => $target['industry'],
-        'education'   => $target['education'],
+        'job_title'        => $target['job_title'],
+        'company'          => $target['company_name'],
+        'years_at_company' => $target['years_at_company'] !== null ? (int) $target['years_at_company'] : null,
+        'description'      => $target['work_description'],
+        'industry'         => $target['industry'],
+        'education'        => $target['education'],
+    ];
+
+    // Personal
+    $profile['personal'] = [
+        'relationship_status' => $target['relationship_status'],
+        'has_kids'            => $target['has_kids'] !== null ? (bool) $target['has_kids'] : null,
+        'kids_count'          => $target['kids_count'] !== null ? (int) $target['kids_count'] : null,
+        'languages_spoken'    => $target['languages_spoken'],
+        'personality_type'    => $target['personality_type'],
+        'zodiac_sign'         => $target['zodiac_sign'],
+        'availability'        => $target['availability'],
+        'contact_preference'  => $target['contact_preference'],
     ];
 
     // Interests
+    $lookingForRaw = $target['looking_for'] ?? '';
+    $lookingFor    = $lookingForRaw !== '' && $lookingForRaw !== null
+        ? array_values(array_filter(array_map('trim', explode(',', (string) $lookingForRaw))))
+        : [];
+
     $profile['interests'] = [
-        'hobbies'      => $target['hobbies_and_interests'],
-        'looking_for'  => $target['looking_for'],
-        'availability' => $target['availability'],
+        'hobbies'     => $target['hobbies_and_interests'],
+        'looking_for' => $lookingFor,
     ];
 
-    // Social links — respect show_social_links toggle unless it's you
+    // Favorites
+    $decodeJsonList = static function ($raw): array {
+        if ($raw === null || $raw === '') return [];
+        $decoded = json_decode((string) $raw, true);
+        return is_array($decoded) ? array_values(array_filter($decoded, static fn($v) => is_string($v) && $v !== '')) : [];
+    };
+
+    $profile['favorites'] = [
+        'movies' => $decodeJsonList($target['favorite_movies']),
+        'books'  => $decodeJsonList($target['favorite_books']),
+        'songs'  => $decodeJsonList($target['favorite_songs']),
+        'shows'  => $decodeJsonList($target['favorite_shows']),
+        'games'  => $decodeJsonList($target['favorite_games']),
+        'quotes' => $target['favorite_quotes'],
+        'food'   => $target['favorite_food'],
+    ];
+
+    // Social links — respect toggle
     if ($isSelf || (int) $target['show_social_links'] === 1) {
         $profile['links'] = [
-            'website'    => $target['website_url'],
-            'github'     => $target['github_url'],
-            'twitter'    => $target['twitter_url'],
-            'linkedin'   => $target['linkedin_url'],
-            'mastodon'   => $target['mastodon_url'],
-            'bluesky'    => $target['bluesky_url'],
-            'pgp_key'    => $target['public_pgp_key'],
+            'website'       => $target['website_url'],
+            'facebook'      => $target['facebook_url'],
+            'twitter'       => $target['twitter_url'],
+            'instagram'     => $target['instagram_url'],
+            'tiktok'        => $target['tiktok_url'],
+            'linkedin'      => $target['linkedin_url'],
+            'youtube'       => $target['youtube_url'],
+            'threads'       => $target['threads_url'],
+            'mastodon'      => $target['mastodon_url'],
+            'bluesky'       => $target['bluesky_url'],
+            'discord'       => $target['discord_handle'],
+            'steam'         => $target['steam_id'],
+            'psn'           => $target['psn_handle'],
+            'xbox'          => $target['xbox_gamertag'],
+            'kick'          => $target['kick_url'],
+            'twitch'        => $target['twitch_url'],
+            'podcast'       => $target['podcast_url'],
+            'github'        => $target['github_url'],
+            'stackoverflow' => $target['stackoverflow_url'],
+            'hackerone'     => $target['hackerone_url'],
+            'bugcrowd'      => $target['bugcrowd_url'],
+            'intigriti'     => $target['intigriti_url'],
+            'yeswehack'     => $target['yeswehack_url'],
+            'signal'        => $target['signal_username'],
+            'pgp_key'       => $target['public_pgp_key'],
         ];
     }
 
-    // Premium status — respect show_premium toggle unless self
+    // Theme (self only — connections don't need your opacity values)
+    if ($isSelf) {
+        $profile['theme'] = [
+            'wallpaper_opacity' => (int) $target['wallpaper_opacity'],
+            'wallpaper_blur'    => (int) $target['wallpaper_blur'],
+            'accent_color'      => $target['accent_color'],
+            'theme_preference'  => $target['theme_preference'],
+            'border_style'      => $target['border_style'],
+            'border_thickness'  => (int) $target['border_thickness'],
+            'border_color'      => $target['border_color'],
+            'font_heading'      => $target['font_heading'],
+            'font_body'         => $target['font_body'],
+            'font_mono'         => $target['font_mono'],
+            'music_video_id'    => $target['music_video_id'],
+            'music_autoplay'    => (bool) $target['music_autoplay'],
+        ];
+    }
+
+    // Premium — respect toggle
     if ($isSelf || (int) $target['show_premium'] === 1) {
         $profile['is_premium'] = (bool) $target['is_premium'];
     }
