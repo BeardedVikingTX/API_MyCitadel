@@ -29,6 +29,7 @@ require_once CITADEL_CONFIG . '/db.php';
 require_once CITADEL_CONFIG . '/connections.php';
 require_once CITADEL_CONFIG . '/notifications.php';
 require_once CITADEL_CONFIG . '/reputation.php';
+require_once CITADEL_CONFIG . '/messages.php';
 
 citadel_rate_limit('conn_block', 30, 3600);
 citadel_require_csrf();
@@ -120,7 +121,89 @@ try {
             [$targetId]
         );
 
-        // TODO (Batch 4): citadel_messages_destroy_pair($me, $targetId);
+        // ── Destroy every message between the two users ────────────────
+        // Per the Terms of Service: severing a connection destroys the
+        // entire conversation history. Not hidden, not archived, gone.
+        //
+        // The direct conversation between the pair, if it exists, is
+        // removed entirely: messages, participants, and the conversation
+        // row itself. Attachments bound to those messages are also
+        // unlinked from the attachment table so they can be garbage
+        // collected, and their files are deleted from disk.
+        try {
+            $convId = citadel_msg_find_direct($me, $targetId);
+
+            if ($convId !== null) {
+                // Collect attachment file paths BEFORE we delete the
+                // message rows, so we can purge them from disk.
+                $attachmentPaths = db_all(
+                    'SELECT pa.stored_path
+                       FROM post_attachments pa
+                       JOIN message_attachments ma ON ma.attachment_id = pa.id
+                       JOIN messages m ON m.id = ma.message_id
+                      WHERE m.conversation_id = ?',
+                    [$convId]
+                );
+
+                // Delete message attachments join rows
+                db_query(
+                    'DELETE ma FROM message_attachments ma
+                       JOIN messages m ON m.id = ma.message_id
+                      WHERE m.conversation_id = ?',
+                    [$convId]
+                );
+
+                // Delete attachments themselves (rows + files)
+                db_query(
+                    'DELETE pa FROM post_attachments pa
+                       JOIN messages m ON m.id = pa.message_id
+                      WHERE m.conversation_id = ?',
+                    [$convId]
+                );
+
+                // Delete messages
+                db_query(
+                    'DELETE FROM messages WHERE conversation_id = ?',
+                    [$convId]
+                );
+
+                // Delete participants
+                db_query(
+                    'DELETE FROM conversation_participants WHERE conversation_id = ?',
+                    [$convId]
+                );
+
+                // Delete the conversation itself
+                db_query(
+                    'DELETE FROM conversations WHERE id = ?',
+                    [$convId]
+                );
+
+                // Purge files from disk — best-effort, after commit
+                foreach ($attachmentPaths as $row) {
+                    $path = (string) $row['stored_path'];
+                    if ($path !== '' && is_file($path)) {
+                        @unlink($path);
+                    }
+                }
+
+                citadel_log('api', 'info', 'Conversation destroyed on sever', [
+                    'by'              => $me,
+                    'with'            => $targetId,
+                    'conversation_id' => $convId,
+                    'messages_purged' => true,
+                ]);
+            }
+        } catch (Throwable $e) {
+            // Message destruction failure must NOT roll back the block.
+            // The block is the security-critical action; leftover
+            // ciphertext is inert without the connection.
+            citadel_log('api', 'error', 'Message destruction failed on sever', [
+                'by'    => $me,
+                'with'  => $targetId,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     // ── Pending from them? Cancel without counter adjustment ───────────────
