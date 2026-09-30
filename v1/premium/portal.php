@@ -54,16 +54,9 @@ if ($customerId === '') {
 try {
     $portalUrl = citadel_stripe_config('STRIPE_CUSTOMER_PORTAL_URL');
 
-    // If we have a configured portal URL, use it directly with a session
-    // Otherwise create a fresh session (Stripe requires configuration)
-    if ($portalUrl) {
-        // Deep link — Stripe will infer the customer from a prior cookie
-        // if possible, but we still create a session to be deterministic.
-    }
-
     $session = citadel_stripe()->billingPortal->sessions->create([
         'customer'   => $customerId,
-        'return_url' => rtrim(getenv('APP_URL') ?: 'https://mycitadel.lol', '/') . '/dashboard.html',
+        'return_url' => rtrim(getenv('APP_URL') ?: 'https://mycitadel.lol', '/') . '/users/dashboard.php',
     ]);
 
     citadel_log('stripe', 'info', 'Customer portal opened', ['user_id' => $me]);

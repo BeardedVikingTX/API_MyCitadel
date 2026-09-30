@@ -11,6 +11,10 @@
  * Awards +10 reputation on creation.
  * Bumps post_count and checks post_* badges.
  * Binds pending attachments (uploaded via /upload/media.php) to this post.
+ *
+ * TIER LIMITS (inline, no external config):
+ *   Free    — 50 chars, 1 attachment, images only
+ *   Premium — 1,500 chars, 10 attachments, any file type
  * ========================================================================== */
 
 declare(strict_types=1);
@@ -39,9 +43,41 @@ if (citadel_post_recent_count($me) >= CITADEL_POST_RATE_LIMIT) {
         'You are posting too frequently. Try again later.', 429);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * TIER LIMITS — resolved once, used throughout this request
+ * ══════════════════════════════════════════════════════════════════════════
+ *   Free    → 50 chars, 1 attachment, images only
+ *   Premium → 1,500 chars, 10 attachments, images/video/audio/documents
+ *
+ * If the lookup fails for any reason we fall back to the FREE tier.
+ * Premium is opt-in; free is the safe default.
+ * ========================================================================== */
+$isPremium = ((int) db_scalar(
+    'SELECT is_premium FROM users WHERE id = ? LIMIT 1',
+    [$me]
+)) === 1;
+
+if ($isPremium) {
+    $maxChars         = 1500;
+    $maxAttachments   = 10;
+    $allowedKinds     = ['image', 'video', 'audio', 'document'];
+} else {
+    $maxChars         = 50;
+    $maxAttachments   = 1;
+    $allowedKinds     = ['image'];
+}
+
 /* ── Parse input ─────────────────────────────────────────────────────── */
-$contentRaw = citadel_input_string('content', null, CITADEL_POST_MAX_LENGTH * 2);
+$contentRaw = citadel_input_string('content', null, $maxChars * 2);
 $content    = $contentRaw !== null ? citadel_post_sanitize($contentRaw) : '';
+
+/* ── Enforce character limit ─────────────────────────────────────────── */
+if (mb_strlen($content) > $maxChars) {
+    citadel_json_error('tier_limit_exceeded',
+        "Posts are limited to {$maxChars} characters on your tier. " .
+            ($isPremium ? '' : 'Upgrade to Premium for up to 1,500.'),
+        403);
+}
 
 $visibility = citadel_input_string('visibility', 'connections', 16);
 if (!in_array($visibility, ['public', 'connections', 'private'], true)) {
@@ -55,11 +91,20 @@ $attachmentTokens = [];
 $rawTokens        = $body['attachment_tokens'] ?? null;
 
 if (is_array($rawTokens)) {
-    foreach (array_slice($rawTokens, 0, CITADEL_MEDIA_MAX_PER_POST) as $t) {
+    foreach (array_slice($rawTokens, 0, $maxAttachments) as $t) {
         if (is_string($t) && preg_match('/^[a-f0-9]{32}$/', $t)) {
             $attachmentTokens[] = $t;
         }
     }
+}
+
+/* ── Enforce attachment count ────────────────────────────────────────── */
+if (is_array($rawTokens) && count($rawTokens) > $maxAttachments) {
+    $plural = $maxAttachments === 1 ? 'attachment' : 'attachments';
+    citadel_json_error('tier_limit_exceeded',
+        "Posts are limited to {$maxAttachments} {$plural} on your tier. " .
+            ($isPremium ? '' : 'Upgrade to Premium for up to 10.'),
+        403);
 }
 
 /* ── Empty check: allow text OR attachments ──────────────────────────── */
@@ -73,7 +118,7 @@ $ownedTokens = [];
 if (!empty($attachmentTokens)) {
     $ph = implode(',', array_fill(0, count($attachmentTokens), '?'));
     $rows = db_all(
-        "SELECT served_token
+        "SELECT served_token, kind
            FROM post_attachments
           WHERE served_token IN ($ph)
             AND user_id = ?
@@ -86,6 +131,19 @@ if (!empty($attachmentTokens)) {
     if (count($ownedTokens) !== count($attachmentTokens)) {
         citadel_json_error('invalid_attachments',
             'One or more attachments are invalid or already used.', 400);
+    }
+
+    /* ── Enforce allowed attachment kinds ────────────────────────────── */
+    foreach ($rows as $row) {
+        $kind = (string) $row['kind'];
+        if (!in_array($kind, $allowedKinds, true)) {
+            $allowedList = implode(', ', $allowedKinds);
+            citadel_json_error('tier_limit_exceeded',
+                "Your tier does not allow '{$kind}' attachments. " .
+                    "Allowed: {$allowedList}." .
+                    ($isPremium ? '' : ' Upgrade to Premium to unlock all file types.'),
+                403);
+        }
     }
 }
 
@@ -134,6 +192,7 @@ try {
 citadel_log('api', 'info', 'Post created', [
     'post_id'     => $postId,
     'user_id'     => $me,
+    'tier'        => $isPremium ? 'premium' : 'free',
     'visibility'  => $visibility,
     'attachments' => count($ownedTokens),
 ]);
