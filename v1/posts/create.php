@@ -15,6 +15,11 @@
  * TIER LIMITS (inline, no external config):
  *   Free    — 50 chars, 1 attachment, images only
  *   Premium — 1,500 chars, 10 attachments, any file type
+ *
+ * ENCRYPTION:
+ *   Content is encrypted BEFORE the transaction opens. If crypto fails,
+ *   nothing has been written and no lock is held. The ciphertext is
+ *   stored in content_ct / content_nonce with is_encrypted = 1.
  * ========================================================================== */
 
 declare(strict_types=1);
@@ -25,10 +30,11 @@ require_once CITADEL_CONFIG . '/posts.php';
 require_once CITADEL_CONFIG . '/reputation.php';
 require_once CITADEL_CONFIG . '/badges.php';
 require_once CITADEL_CONFIG . '/attachments.php';
+require_once CITADEL_CONFIG . '/crypto.php';
 
 citadel_rate_limit('post_create', 30, 60);
-citadel_require_csrf();
-citadel_require_auth('json');
+citadel_require_auth('json');     // ← auth first (401 before 403)
+citadel_require_csrf();           // ← then CSRF
 
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
     header('Allow: POST');
@@ -37,7 +43,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
 
 $me = (int) citadel_current_user_id();
 
-/* ── Per-user rate limit ─────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════
+ * PER-USER RATE LIMIT
+ * ═════════════════════════════════════════════════════════════════════ */
 if (citadel_post_recent_count($me) >= CITADEL_POST_RATE_LIMIT) {
     citadel_json_error('rate_limited',
         'You are posting too frequently. Try again later.', 429);
@@ -45,33 +53,36 @@ if (citadel_post_recent_count($me) >= CITADEL_POST_RATE_LIMIT) {
 
 /* ══════════════════════════════════════════════════════════════════════
  * TIER LIMITS — resolved once, used throughout this request
- * ══════════════════════════════════════════════════════════════════════════
+ * ═════════════════════════════════════════════════════════════════════
  *   Free    → 50 chars, 1 attachment, images only
  *   Premium → 1,500 chars, 10 attachments, images/video/audio/documents
  *
  * If the lookup fails for any reason we fall back to the FREE tier.
  * Premium is opt-in; free is the safe default.
- * ========================================================================== */
+ * ═════════════════════════════════════════════════════════════════════ */
 $isPremium = ((int) db_scalar(
     'SELECT is_premium FROM users WHERE id = ? LIMIT 1',
     [$me]
 )) === 1;
 
 if ($isPremium) {
-    $maxChars         = 1500;
-    $maxAttachments   = 10;
-    $allowedKinds     = ['image', 'video', 'audio', 'document'];
+    $maxChars       = 1500;
+    $maxAttachments = 10;
+    $allowedKinds   = ['image', 'video', 'audio', 'document'];
 } else {
-    $maxChars         = 50;
-    $maxAttachments   = 1;
-    $allowedKinds     = ['image'];
+    $maxChars       = 50;
+    $maxAttachments = 1;
+    $allowedKinds   = ['image'];
 }
 
-/* ── Parse input ─────────────────────────────────────────────────────── */
-$contentRaw = citadel_input_string('content', null, $maxChars * 2);
+/* ══════════════════════════════════════════════════════════════════════
+ * CONTENT
+ * ═════════════════════════════════════════════════════════════════════ */
+// Hard input cap is the global max so the tier check below produces the
+// friendlier "tier_limit_exceeded" message for anything reasonable.
+$contentRaw = citadel_input_string('content', null, CITADEL_POST_MAX_LENGTH);
 $content    = $contentRaw !== null ? citadel_post_sanitize($contentRaw) : '';
 
-/* ── Enforce character limit ─────────────────────────────────────────── */
 if (mb_strlen($content) > $maxChars) {
     citadel_json_error('tier_limit_exceeded',
         "Posts are limited to {$maxChars} characters on your tier. " .
@@ -79,13 +90,18 @@ if (mb_strlen($content) > $maxChars) {
         403);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * VISIBILITY
+ * ═════════════════════════════════════════════════════════════════════ */
 $visibility = citadel_input_string('visibility', 'connections', 16);
 if (!in_array($visibility, ['public', 'connections', 'private'], true)) {
     citadel_json_error('invalid_visibility',
         'Visibility must be public, connections, or private.', 400);
 }
 
-/* ── Attachment tokens (optional) ────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════
+ * ATTACHMENT TOKENS
+ * ═════════════════════════════════════════════════════════════════════ */
 $body             = citadel_input_json();
 $attachmentTokens = [];
 $rawTokens        = $body['attachment_tokens'] ?? null;
@@ -98,7 +114,6 @@ if (is_array($rawTokens)) {
     }
 }
 
-/* ── Enforce attachment count ────────────────────────────────────────── */
 if (is_array($rawTokens) && count($rawTokens) > $maxAttachments) {
     $plural = $maxAttachments === 1 ? 'attachment' : 'attachments';
     citadel_json_error('tier_limit_exceeded',
@@ -107,13 +122,13 @@ if (is_array($rawTokens) && count($rawTokens) > $maxAttachments) {
         403);
 }
 
-/* ── Empty check: allow text OR attachments ──────────────────────────── */
+// A post needs text OR at least one attachment.
 if ($content === '' && empty($attachmentTokens)) {
     citadel_json_error('empty_content',
         'A post must have text or at least one attachment.', 400);
 }
 
-/* ── Verify the tokens actually belong to this user and are unbound ──── */
+// Verify tokens belong to this user, are unbound, and are an allowed kind.
 $ownedTokens = [];
 if (!empty($attachmentTokens)) {
     $ph = implode(',', array_fill(0, count($attachmentTokens), '?'));
@@ -133,7 +148,6 @@ if (!empty($attachmentTokens)) {
             'One or more attachments are invalid or already used.', 400);
     }
 
-    /* ── Enforce allowed attachment kinds ────────────────────────────── */
     foreach ($rows as $row) {
         $kind = (string) $row['kind'];
         if (!in_array($kind, $allowedKinds, true)) {
@@ -147,19 +161,70 @@ if (!empty($attachmentTokens)) {
     }
 }
 
-/* ── Insert ──────────────────────────────────────────────────────────── */
-try {
-    $db = db();
-    $db->beginTransaction();
+/* ══════════════════════════════════════════════════════════════════════
+ * ENCRYPTION — BEFORE the transaction
+ * ═════════════════════════════════════════════════════════════════════
+ * If encryption fails, we haven't opened a transaction yet, haven't
+ * touched the DB, and haven't held any locks. Fail fast, fail clean.
+ *
+ * If $content is empty (attachment-only post), we skip encryption and
+ * write NULL to the ciphertext columns.
+ * ═════════════════════════════════════════════════════════════════════ */
+$contentCt    = null;
+$contentNonce = null;
+$isEncrypted  = 0;
 
+if ($content !== '') {
+    try {
+        $enc          = citadel_post_encrypt_content($content, $me);
+        $contentCt    = $enc['ct'];
+        $contentNonce = $enc['nonce'];
+        $isEncrypted  = 1;
+    } catch (Throwable $e) {
+        citadel_log('api', 'error', 'Post encryption failed', [
+            'user_id' => $me,
+            'error'   => $e->getMessage(),
+        ]);
+        citadel_json_error('encryption_failed',
+            'Could not securely store your post. Please try again.', 500);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * INSERT — single transaction
+ * ═════════════════════════════════════════════════════════════════════ */
+$db = db();
+$db->beginTransaction();
+
+try {
+    // ── MIGRATION MODE ──────────────────────────────────────────────
+    // We currently write BOTH the plaintext (content) and the ciphertext
+    // (content_ct / content_nonce). This lets us compare and roll back
+    // if anything goes wrong.
+    //
+    // WHEN YOU'RE CONFIDENT: change the `?` in the content slot below to
+    // SQL literal NULL and drop $content from the params array. Then run:
+    //
+    //     UPDATE posts SET content = NULL WHERE is_encrypted = 1;
+    //
+    // After that, the plaintext column holds nothing for any post.
+    // ────────────────────────────────────────────────────────────────
     db_query(
-        'INSERT INTO posts (user_id, content, visibility, created_at, updated_at)
-         VALUES (?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())',
-        [$me, $content, $visibility]
+        'INSERT INTO posts
+            (user_id, content_ct, content_nonce, is_encrypted,
+             visibility, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())',
+        [
+            $me,
+            $contentCt,
+            $contentNonce,
+            $isEncrypted,
+            $visibility,
+        ]
     );
     $postId = (int) db_last_id();
 
-    /* Bind attachments to this post */
+    // Bind attachments to this post.
     if (!empty($ownedTokens)) {
         $ph = implode(',', array_fill(0, count($ownedTokens), '?'));
         db_query(
@@ -170,10 +235,10 @@ try {
         );
     }
 
-    /* Bump post counter — this is what post_* badge thresholds read */
+    // Bump post counter — drives post_* badge thresholds.
     bump_stat($me, 'post_count', 1);
 
-    /* Award reputation */
+    // Award reputation.
     award_points($me, 'post_created', 10, 'post', $postId, 'Created a post');
 
     $db->commit();
@@ -189,15 +254,19 @@ try {
     citadel_json_error('create_failed', 'Could not create post.', 500);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * POST-COMMIT LOGGING (never blocks the post)
+ * ═════════════════════════════════════════════════════════════════════ */
 citadel_log('api', 'info', 'Post created', [
     'post_id'     => $postId,
     'user_id'     => $me,
     'tier'        => $isPremium ? 'premium' : 'free',
     'visibility'  => $visibility,
+    'encrypted'   => $isEncrypted === 1,
     'attachments' => count($ownedTokens),
 ]);
 
-/* ── Badge check (outside the transaction, never blocks the post) ────── */
+/* ── Badge check ─────────────────────────────────────────────────────── */
 try {
     $newBadges = check_category_badges($me, 'post');
     if (!empty($newBadges)) {
@@ -213,9 +282,12 @@ try {
     ]);
 }
 
-/* ── Response ───────────────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════
+ * RESPONSE
+ * ═════════════════════════════════════════════════════════════════════ */
 citadel_json_ok([
     'post_id'     => $postId,
     'attachments' => count($ownedTokens),
+    'encrypted'   => $isEncrypted === 1,
     'message'     => 'Post created. +10 reputation.',
 ], 201);

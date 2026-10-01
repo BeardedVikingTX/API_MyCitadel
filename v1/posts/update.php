@@ -12,6 +12,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/../bootstrap.php';
 require_once CITADEL_CONFIG . '/db.php';
 require_once CITADEL_CONFIG . '/posts.php';
+require_once CITADEL_CONFIG . '/crypto.php';
 
 citadel_rate_limit('post_update', 30, 60);
 citadel_require_csrf();
@@ -48,8 +49,24 @@ if ($newContent !== null) {
     if ($clean === '') {
         citadel_json_error('empty_content', 'Post content cannot be empty.', 400);
     }
-    if ($clean !== $post['content']) {
-        $updates['content'] = $clean;
+
+    // Decrypt current content for comparison. `is_encrypted` rows use the
+    // ciphertext path; legacy rows fall back to the plaintext column, with
+    // a `?? ''` guard in case that column is NULL for an unmigrated row.
+    $currentPlain = (int) $post['is_encrypted'] === 1
+        ? (citadel_post_decrypt_content(
+              $post['content_ct']    ?? null,
+              $post['content_nonce'] ?? null,
+              (int) $post['user_id']
+          ) ?? '')
+        : (string) ($post['content'] ?? '');
+
+    if ($clean !== $currentPlain) {
+        $enc = citadel_post_encrypt_content($clean, $me);
+        // $updates['content']       = null;      // ← no more plaintext writes
+        $updates['content_ct']    = $enc['ct'];
+        $updates['content_nonce'] = $enc['nonce'];
+        $updates['is_encrypted']  = 1;
     }
 }
 
