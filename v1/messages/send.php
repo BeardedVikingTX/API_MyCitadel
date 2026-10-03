@@ -1,4 +1,15 @@
 <?php
+/* ============================================================================
+ * ███ MESSAGES/SEND.PHP ███
+ * Route : POST /v1/messages/send
+ * Body  : { "conversation_id": N, "body": "...", "attachment_tokens": [...] }
+ *         or { "to": N, "body": "..." }
+ *
+ * TIER LIMITS (inline, no external config):
+ *   Free    — 1 attachment, images only
+ *   Premium — 10 attachments, images/video/audio/documents
+ * ========================================================================== */
+
 declare(strict_types=1);
 require_once __DIR__ . '/../bootstrap.php';
 require_once CITADEL_CONFIG . '/db.php';
@@ -15,6 +26,22 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
 
 $me   = (int) citadel_current_user_id();
 $body = citadel_input_json();
+
+/* ══════════════════════════════════════════════════════════════════════
+ * TIER LIMITS — resolved once
+ * ========================================================================== */
+$isPremium = ((int) db_scalar(
+    'SELECT is_premium FROM users WHERE id = ? LIMIT 1',
+    [$me]
+)) === 1;
+
+if ($isPremium) {
+    $maxAttachments = 10;
+    $allowedKinds   = ['image', 'video', 'audio', 'document'];
+} else {
+    $maxAttachments = 1;
+    $allowedKinds   = ['image'];
+}
 
 $convId = isset($body['conversation_id']) ? (int) $body['conversation_id'] : 0;
 $to     = isset($body['to']) ? (int) $body['to'] : 0;
@@ -43,9 +70,19 @@ $bodyText = isset($body['body']) && is_string($body['body']) ? trim($body['body'
 
 $tokens = [];
 if (isset($body['attachment_tokens']) && is_array($body['attachment_tokens'])) {
-    foreach (array_slice($body['attachment_tokens'], 0, CITADEL_MSG_MAX_ATTACHMENTS) as $t) {
+    foreach (array_slice($body['attachment_tokens'], 0, $maxAttachments) as $t) {
         if (is_string($t) && preg_match('/^[a-f0-9]{32}$/', $t)) $tokens[] = $t;
     }
+}
+
+/* ── Enforce attachment count ────────────────────────────────────────── */
+if (is_array($body['attachment_tokens'] ?? null)
+    && count($body['attachment_tokens']) > $maxAttachments) {
+    $plural = $maxAttachments === 1 ? 'attachment' : 'attachments';
+    citadel_json_error('tier_limit_exceeded',
+        "Messages are limited to {$maxAttachments} {$plural} on your tier. " .
+            ($isPremium ? '' : 'Upgrade to Premium for up to 10.'),
+        403);
 }
 
 if ($bodyText === '' && empty($tokens)) {
@@ -57,6 +94,42 @@ if (mb_strlen($bodyText) > CITADEL_MSG_MAX_CHARS) {
         'Messages are limited to ' . CITADEL_MSG_MAX_CHARS . ' characters.', 400);
 }
 
+/* ── Validate attachment ownership + allowed kinds ───────────────────── */
+$ownedTokens = [];
+if (!empty($tokens)) {
+    $ph = implode(',', array_fill(0, count($tokens), '?'));
+    $rows = db_all(
+        "SELECT served_token, kind
+           FROM post_attachments
+          WHERE served_token IN ($ph)
+            AND user_id = ?
+            AND post_id IS NULL
+            AND comment_id IS NULL
+            AND message_id IS NULL",
+        array_merge($tokens, [$me])
+    );
+
+    if (count($rows) !== count($tokens)) {
+        citadel_json_error('invalid_attachments',
+            'One or more attachments are invalid or already used.', 400);
+    }
+
+    foreach ($rows as $row) {
+        $kind = (string) $row['kind'];
+        if (!in_array($kind, $allowedKinds, true)) {
+            $allowedList = implode(', ', $allowedKinds);
+            citadel_json_error('tier_limit_exceeded',
+                "Your tier does not allow '{$kind}' attachments. " .
+                    "Allowed: {$allowedList}." .
+                    ($isPremium ? '' : ' Upgrade to Premium to unlock all file types.'),
+                403);
+        }
+    }
+
+    $ownedTokens = array_map(static fn($r) => (string) $r['served_token'], $rows);
+}
+
+/* ── Idempotency ─────────────────────────────────────────────────────── */
 $idem = null;
 if (isset($body['idempotency_key']) && is_string($body['idempotency_key'])) {
     if (preg_match('/^[a-f0-9]{32}$/', $body['idempotency_key'])) {
@@ -75,6 +148,7 @@ if (isset($body['idempotency_key']) && is_string($body['idempotency_key'])) {
     }
 }
 
+/* ── Encrypt ─────────────────────────────────────────────────────────── */
 try {
     $enc = citadel_msg_encrypt_body($bodyText, $convId);
 } catch (Throwable $e) {
@@ -84,6 +158,7 @@ try {
     citadel_json_error('encrypt_failed', 'Could not encrypt message.', 500);
 }
 
+/* ── Insert ──────────────────────────────────────────────────────────── */
 $db = db();
 $db->beginTransaction();
 
@@ -96,18 +171,13 @@ try {
     );
     $msgId = (int) db_last_id();
 
-    // Bind attachments
-    if (!empty($tokens)) {
-        $ph = implode(',', array_fill(0, count($tokens), '?'));
+    if (!empty($ownedTokens)) {
+        $ph = implode(',', array_fill(0, count($ownedTokens), '?'));
         db_query(
             "UPDATE post_attachments
                 SET message_id = ?
-              WHERE served_token IN ($ph)
-                AND user_id = ?
-                AND post_id IS NULL
-                AND comment_id IS NULL
-                AND message_id IS NULL",
-            array_merge([$msgId], $tokens, [$me])
+              WHERE served_token IN ($ph)",
+            array_merge([$msgId], $ownedTokens)
         );
     }
 
@@ -116,7 +186,6 @@ try {
         [$convId]
     );
 
-    // Sender auto-reads own message
     db_query(
         'UPDATE conversation_participants
             SET last_read_message_id = GREATEST(last_read_message_id, ?)
@@ -133,7 +202,7 @@ try {
     citadel_json_error('send_failed', 'Could not send message.', 500);
 }
 
-// Notify recipient
+/* ── Notify recipient ────────────────────────────────────────────────── */
 $otherId = citadel_msg_other_user($convId, $me);
 if ($otherId !== null) {
     try {
@@ -153,6 +222,14 @@ if ($otherId !== null) {
         ]);
     }
 }
+
+citadel_log('api', 'info', 'Message sent', [
+    'message_id'      => $msgId,
+    'conversation_id' => $convId,
+    'user_id'         => $me,
+    'tier'            => $isPremium ? 'premium' : 'free',
+    'attachments'     => count($ownedTokens),
+]);
 
 citadel_json_ok([
     'message_id'      => $msgId,

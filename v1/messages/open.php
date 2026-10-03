@@ -17,6 +17,29 @@ $me   = (int) citadel_current_user_id();
 $body = citadel_input_json();
 $to   = isset($body['to']) ? (int) $body['to'] : 0;
 
+/* ══════════════════════════════════════════════════════════════════════
+ * TIER LIMITS
+ * --------------------------------------------------------------------------
+ * Free users may start 1-on-1 conversations only. Group creation is a
+ * Premium feature. The $is_group check below is a forward-compatible
+ * gate: once group support lands, this branch already enforces the tier.
+ * ========================================================================== */
+$isPremium = ((int) db_scalar(
+    'SELECT is_premium FROM users WHERE id = ? LIMIT 1',
+    [$me]
+)) === 1;
+
+$isGroupRequest = !empty($body['is_group'])
+    || !empty($body['participants'])
+    || !empty($body['member_ids']);
+
+if ($isGroupRequest && !$isPremium) {
+    citadel_json_error('tier_limit_exceeded',
+        'Creating group conversations is a Premium feature. ' .
+            'Free users can start 1-on-1 conversations with their connections.',
+        403);
+}
+
 if ($to <= 0 || $to === $me) {
     citadel_json_error('invalid_target', 'Valid target user required.', 400);
 }
@@ -32,6 +55,14 @@ try {
 } catch (Throwable $e) {
     citadel_json_error('open_failed', 'Could not open conversation.', 500);
 }
+
+citadel_log('api', 'info', 'Conversation opened', [
+    'user_id'         => $me,
+    'target_id'       => $to,
+    'conversation_id' => $convId,
+    'created'         => $existing === null,
+    'tier'            => $isPremium ? 'premium' : 'free',
+]);
 
 citadel_json_ok([
     'conversation_id' => $convId,
